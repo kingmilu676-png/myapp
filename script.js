@@ -21,31 +21,38 @@ const SUPABASE_URL = 'https://knafkiozaguyvemtrjfz.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// === 2000 RECORDS LIMIT SETTING ===
 const HISTORY_LIMIT = 2000;
 
 let historyRecords = [];
 let savedPredictions = {};
 let lastProcessedPeriod = null;
 
-// Serve Static Files & Index Page
+// Fallback Period Generator
+function getCurrentFallbackPeriod() {
+    const now = new Date();
+    const YYYY = now.getFullYear();
+    const MM = String(now.getMonth() + 1).padStart(2, '0');
+    const DD = String(now.getDate()).padStart(2, '0');
+    const totalSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    const periodSeq = String(Math.floor(totalSeconds / 30) + 1).padStart(4, '0');
+    return `${YYYY}${MM}${DD}1000${periodSeq}`;
+}
+
 app.use(express.static(__dirname));
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Analytics Stats Object
 let analyticsStats = {
     totalAnalyzed: 0,
     bigPercent: 50,
     smallPercent: 50,
-    hotNumber: "-",
-    overdueNumber: "-",
-    winRate: 0
+    hotNumber: 5,
+    overdueNumber: 2,
+    winRate: "0.0"
 };
 
-// Supabase se 2000 data load karein aur Analyze karein
 async function loadHistoryFromSupabase() {
     try {
         const { data, error } = await supabase
@@ -76,7 +83,6 @@ async function loadHistoryFromSupabase() {
     }
 }
 
-// === 2000 RECORDS ANALYSIS ENGINE ===
 function runDeepDataAnalysis() {
     if (!historyRecords || historyRecords.length === 0) return;
 
@@ -105,8 +111,8 @@ function runDeepDataAnalysis() {
 
     let maxFreq = -1;
     let minFreq = Infinity;
-    let hotNum = 0;
-    let overdueNum = 0;
+    let hotNum = 5;
+    let overdueNum = 2;
 
     numFreq.forEach((freq, num) => {
         if (freq > maxFreq) {
@@ -130,14 +136,13 @@ function runDeepDataAnalysis() {
 }
 
 let currentRound = {
-    periodNumber: "Loading...",
+    periodNumber: getCurrentFallbackPeriod(),
     countdown: 30,
-    livePrediction: { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" }
+    livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
 };
 
-// Smart Prediction Logic
 function generateProbabilityPattern(periodStr, history) {
-    if (!history || history.length < 3) return { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" };
+    if (!history || history.length < 3) return { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" };
 
     let last1 = history[0].number;
     let last2 = history[1].number;
@@ -151,7 +156,6 @@ function generateProbabilityPattern(periodStr, history) {
     let calculatedNum = (last1 * 3 + last2 * 2 + last3 + (p1 * 7) + p2 + hotBonus) % 10;
     if (calculatedNum < 0) calculatedNum += 10;
 
-    // Strict Repeat Blocker
     if (calculatedNum === last1) {
         calculatedNum = (last1 + 3) % 10;
     }
@@ -162,25 +166,25 @@ function generateProbabilityPattern(periodStr, history) {
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
-// Fetch Official API & Sync with Supabase
+// === OFFICIAL DAMAN API INTEGRATION ===
 async function fetchDamanApiData() {
     const timestamp = Date.now();
     const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
 
-    https.get(url, {
+    const req = https.get(url, {
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Cache-Control': 'no-cache'
-        }
+        },
+        timeout: 4000
     }, (res) => {
         let rawData = '';
         res.on('data', (chunk) => { rawData += chunk; });
         res.on('end', async () => {
             try {
                 if (rawData.trim().startsWith('<')) {
-                    console.log("API returned HTML (Block page). Skipping this cycle...");
                     return;
                 }
 
@@ -246,30 +250,16 @@ async function fetchDamanApiData() {
                 if (historyRecords.length > 0) {
                     let latestIssue = BigInt(historyRecords[0].issue);
                     let nextIssueStr = (latestIssue + 1n).toString();
-
-                    if (nextIssueStr !== lastProcessedPeriod) {
-                        lastProcessedPeriod = nextIssueStr;
-                        currentRound.periodNumber = nextIssueStr;
-
-                        if (savedPredictions[nextIssueStr] === undefined) {
-                            let newPred = generateProbabilityPattern(nextIssueStr, historyRecords);
-                            currentRound.livePrediction = newPred;
-                            savedPredictions[nextIssueStr] = newPred.suggestedNum;
-                        } else {
-                            let pNum = savedPredictions[nextIssueStr];
-                            let targetType = pNum >= 5 ? "Big" : "Small";
-                            let color = pNum % 2 === 0 ? "Red" : "Green";
-                            currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
-                        }
-                    }
+                    currentRound.periodNumber = nextIssueStr;
                 }
             } catch (e) {
-                console.error("API Parse Error:", e.message);
+                // Ignore parsing errors gracefully
             }
         });
-    }).on('error', (err) => {
-        console.error("Network/API Error:", err.message);
     });
+
+    req.on('error', (err) => {});
+    req.on('timeout', () => { req.destroy(); });
 }
 
 function startSyncLoop() {
@@ -280,6 +270,23 @@ function startSyncLoop() {
             currentRound.countdown--;
         } else {
             currentRound.countdown = 30;
+            if (historyRecords.length > 0) {
+                let latestIssue = BigInt(historyRecords[0].issue);
+                currentRound.periodNumber = (latestIssue + 1n).toString();
+            } else {
+                currentRound.periodNumber = getCurrentFallbackPeriod();
+            }
+        }
+
+        if (savedPredictions[currentRound.periodNumber] === undefined) {
+            let newPred = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
+            currentRound.livePrediction = newPred;
+            savedPredictions[currentRound.periodNumber] = newPred.suggestedNum;
+        } else {
+            let pNum = savedPredictions[currentRound.periodNumber];
+            let targetType = pNum >= 5 ? "Big" : "Small";
+            let color = pNum % 2 === 0 ? "Red" : "Green";
+            currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
         }
 
         io.emit('timerUpdate', {
@@ -292,9 +299,7 @@ function startSyncLoop() {
     }, 1000);
 }
 
-// Socket Connection
 io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
     socket.emit('timerUpdate', {
         periodNumber: currentRound.periodNumber,
         countdown: currentRound.countdown,
@@ -306,7 +311,7 @@ io.on('connection', (socket) => {
 
 loadHistoryFromSupabase().then(() => {
     server.listen(PORT, () => {
-        console.log(`Facing AI Server running at http://localhost:${PORT} with 2000 Records & Live Display!`);
+        console.log(`Facing AI Server running at http://localhost:${PORT}`);
         startSyncLoop();
     });
 });
