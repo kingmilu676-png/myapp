@@ -6,6 +6,9 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
+app.get('/', (req, res) => {
+  res.send('Facing AI Pattern Tool is Live!');
+});
 const io = new Server(server, {
     cors: {
         origin: "*",
