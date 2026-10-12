@@ -39,15 +39,19 @@ let analyticsStats = {
 };
 
 // ============================================================
-// === ROBUST API FETCH (DIRECT + PROXY FALLBACK) =============
+// === ROBUST API FETCH (ORIGIN + PROXIES + FALLBACK) =========
 // ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
+const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
+const FALLBACK_PRED = 'https://indialotteryapi.com/wp-json/wingo/v1/predict?market=0.5&n=1';
 
-// Render/cloud IP ko origin 403 ya HTML deta hai -> proxy fallback zaroori hai
+// Origin ab server/cloud IPs ko 403 deta hai -> proxy + fallback zaroori
 const PROXIES = [
+    (u) => 'https://proxy.cors.dev/' + u,
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
     (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
-    (u) => 'https://r.jina.ai/' + u,
-    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)
+    (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u)
 ];
 
 const API_HEADERS = {
@@ -141,16 +145,45 @@ async function fetchRawApi() {
                 continue;
             }
             const json = tryParseJson(res.raw);
-            if (json) {
-                console.log(`[API] ${att.name} OK`);
-                return json;
+            if (!json) { console.log(`[API] ${att.name} not JSON: ${res.raw.slice(0, 80)}`); continue; }
+            // corsproxy key-error jaisa {"error":...} skip karo
+            if (json.error && !(json.data && json.data.list)) {
+                console.log(`[API] ${att.name} error json: ${JSON.stringify(json).slice(0, 80)}`);
+                continue;
             }
-            console.log(`[API] ${att.name} not JSON: ${res.raw.slice(0, 80)}`);
+            console.log(`[API] ${att.name} OK`);
+            return json;
         } catch (e) {
             console.log(`[API] ${att.name} error: ${e.message}`);
         }
     }
     return null;
+}
+
+// Fallback: indialotteryapi.com (no auth, datacenter se chalta hai)
+async function fetchFallback() {
+    try {
+        const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
+        if (!nx || !nx.period) return false;
+
+        currentRound.periodNumber = nx.period;
+        if (typeof nx.remain === 'number') currentRound.countdown = nx.remain;
+
+        const pr = tryParseJson((await httpGetText(FALLBACK_PRED)).raw);
+        const item = pr && pr.items && pr.items[0];
+        if (item) {
+            currentRound.livePrediction = {
+                suggestedNum: item.digit,
+                suggestedType: item.bigSmall,
+                suggestedColor: item.color
+            };
+        }
+        console.log(`[API] fallback OK period=${nx.period} remain=${nx.remain}`);
+        return true;
+    } catch (e) {
+        console.log('[API] fallback error:', e.message);
+        return false;
+    }
 }
 // ============================================================
 
@@ -447,7 +480,7 @@ let currentRound = {
     livePrediction: { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" }
 };
 
-let currentRunCountdown = 30; // (bug fix: pehle ye undeclared tha)
+let currentRunCountdown = 30;
 
 // Smart Prediction Logic
 function generateProbabilityPattern(periodStr, history) {
@@ -480,7 +513,7 @@ function generateProbabilityPattern(periodStr, history) {
 async function fetchDamanApiData() {
     const json = await fetchRawApi();
     if (!json) {
-        console.error("API Fetch Error: direct + all proxies failed");
+        await fetchFallback();
         return;
     }
 
@@ -549,7 +582,7 @@ async function fetchDamanApiData() {
             if (nextIssueStr !== lastProcessedPeriod) {
                 lastProcessedPeriod = nextIssueStr;
                 currentRound.periodNumber = nextIssueStr;
-                currentRound.countdown = 30; // (bug fix: naya period = timer reset)
+                currentRound.countdown = 30;
 
                 if (savedPredictions[nextIssueStr] === undefined) {
                     let newPred = generateProbabilityPattern(nextIssueStr, historyRecords);
