@@ -7,21 +7,18 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 const PORT = process.env.PORT || 3000;
 
-// === SUPABASE CONFIGURATION ===
-const SUPABASE_URL = 'https://knafkiozaguyvemtrjfz.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
+// === SUPABASE ===
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://knafkiozaguyvemtrjfz.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const HISTORY_LIMIT = 2000;
+const POLL_MS = 3000;
+const PERIOD_SECONDS = 30;
 
 let historyRecords = [];
 let savedPredictions = {};
@@ -33,11 +30,20 @@ let analyticsStats = {
     totalAnalyzed: 0,
     bigPercent: 50,
     smallPercent: 50,
-    hotNumber: "-",
-    overdueNumber: "-",
+    hotNumber: '-',
+    overdueNumber: '-',
     winRate: 0
 };
 
+let currentRound = {
+    periodNumber: 'Loading...',
+    countdown: PERIOD_SECONDS,
+    livePrediction: null
+};
+
+// ============================================================
+// === ROBUST API FETCH (BYPASS + PROXIES + FALLBACK)
+// ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
 const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY || '';
@@ -61,7 +67,7 @@ const API_HEADERS = {
 
 function httpGetText(url, redirectsLeft = 5) {
     return new Promise((resolve, reject) => {
-        const req = https.get(url, { headers: API_HEADERS, timeout: 15000 }, (res) => {
+        const req = https.get(url, { headers: API_HEADERS, timeout: 12000 }, (res) => {
             const status = res.statusCode;
             if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
                 res.resume();
@@ -82,7 +88,7 @@ function httpGetText(url, redirectsLeft = 5) {
             stream.on('end', () => resolve({ status, contentType: res.headers['content-type'] || '', raw }));
             stream.on('error', reject);
         });
-        req.on('timeout', () => req.destroy(new Error('Request timeout')));
+        req.on('timeout', () => req.destroy(new Error('timeout')));
         req.on('error', reject);
     });
 }
@@ -91,13 +97,13 @@ function tryParseJson(text) {
     if (!text) return null;
     let t = text.trim().replace(/^\uFEFF/, '');
     if (t.startsWith('```')) t = t.replace(/```json/gi, '').replace(/```/g, '').trim();
-    try { return JSON.parse(t); } catch (e) { /* continue */ }
+    try { return JSON.parse(t); } catch (e) {}
     const starts = [t.indexOf('{'), t.indexOf('[')].filter(x => x >= 0);
     if (starts.length) {
         const start = Math.min(...starts);
         const end = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
         if (end > start) {
-            try { return JSON.parse(t.slice(start, end + 1)); } catch (e) { /* continue */ }
+            try { return JSON.parse(t.slice(start, end + 1)); } catch (e) {}
         }
     }
     return null;
@@ -128,14 +134,9 @@ function extractList(json) {
 async function fetchRawApi() {
     const target = `${API_BASE}?ts=${Date.now()}`;
     const attempts = [];
-
     if (SCRAPERAPI_KEY) {
-        attempts.push({
-            name: 'scraperapi',
-            url: '[https://api.scraperapi.com/?api_key=](https://api.scraperapi.com/?api_key=)' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target)
-        });
+        attempts.push({ name: 'scraperapi', url: 'https://api.scraperapi.com/?api_key=' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target) });
     }
-
     attempts.push({ name: 'direct', url: target });
     PROXIES.forEach((p, i) => attempts.push({ name: `proxy${i + 1}`, url: p(target) }));
 
@@ -143,23 +144,28 @@ async function fetchRawApi() {
         try {
             const res = await httpGetText(att.url);
             const isHtml = /text\/html/i.test(res.contentType) || res.raw.trim().startsWith('<');
-            if (res.status >= 400 || isHtml) continue;
+            if (res.status >= 400 || isHtml) { console.log(`[API] ${att.name} fail (${res.status})`); continue; }
             const json = tryParseJson(res.raw);
-            if (!json) continue;
+            if (!json) { console.log(`[API] ${att.name} not JSON`); continue; }
+            if (json.error && !(json.data && json.data.list)) { console.log(`[API] ${att.name} err json`); continue; }
+            console.log(`[API] ${att.name} OK`);
             return json;
-        } catch (e) {}
+        } catch (e) {
+            console.log(`[API] ${att.name} error: ${e.message}`);
+        }
     }
     return null;
 }
 
+// STOP BYPASS: API dead ho to bhi countdown/period chalta rahe
 async function fetchFallback() {
     try {
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
-        if (currentRound.periodNumber === "Loading...") {
+        if (currentRound.periodNumber === 'Loading...') {
             if (historyRecords.length > 0) {
                 try { currentRound.periodNumber = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
             }
-            if (currentRound.periodNumber === "Loading..." && nx && nx.period) {
+            if (currentRound.periodNumber === 'Loading...' && nx && nx.period) {
                 currentRound.periodNumber = String(nx.period).replace('-', '');
             }
         }
@@ -168,8 +174,48 @@ async function fetchFallback() {
         }
         return true;
     } catch (e) {
+        console.log('[API] fallback error:', e.message);
         return false;
     }
+}
+// ============================================================
+
+// ============================================================
+// === HELPERS ===
+// ============================================================
+function colorFor(n) {
+    if (n === 0 || n === 5) return 'Violet';
+    return n % 2 === 0 ? 'Red' : 'Green';
+}
+function typeFor(n) { return n >= 5 ? 'Big' : 'Small'; }
+
+function sortDesc() {
+    historyRecords.sort((a, b) => {
+        try { return BigInt(b.issue) > BigInt(a.issue) ? 1 : (BigInt(b.issue) < BigInt(a.issue) ? -1 : 0); }
+        catch (e) { return b.issue.localeCompare(a.issue); }
+    });
+}
+
+// ============================================================
+// === SUPABASE PERSIST ===
+// ============================================================
+async function persistPrediction(period, num) {
+    const { error } = await supabase.from('test_results').upsert({
+        period_number: period,
+        pred_num: num,
+        status: 'PENDING'
+    }, { onConflict: 'period_number' });
+    if (error) console.error('persistPrediction:', error.message);
+}
+
+async function persistResult(period, num, predNum, status) {
+    const { error } = await supabase.from('test_results').upsert({
+        period_number: period,
+        results: String(num),
+        pred_num: predNum,
+        status: status
+    }, { onConflict: 'period_number' });
+    if (error) console.error('persistResult:', error.message);
 }
 
 async function loadHistoryFromSupabase() {
@@ -180,62 +226,60 @@ async function loadHistoryFromSupabase() {
             .order('period_number', { ascending: false })
             .limit(HISTORY_LIMIT);
 
-        if (error) return;
+        if (error) { console.error('Supabase Load Error:', error.message); return; }
+        if (!data || !data.length) return;
 
-        if (data && data.length > 0) {
-            historyRecords = data.map(item => ({
-                issue: String(item.period_number),
-                number: parseInt(item.results ?? 0),
-                type: parseInt(item.results ?? 0) >= 5 ? "Big" : "Small",
-                color: parseInt(item.results ?? 0) % 2 === 0 ? "Red" : "Green",
+        historyRecords = [];
+        for (const item of data) {
+            const period = String(item.period_number);
+            if (item.pred_num !== null && item.pred_num !== undefined) {
+                savedPredictions[period] = item.pred_num;
+            }
+            const raw = item.results;
+            if (raw === null || raw === undefined || raw === '') continue; // pending row -> skip
+            const num = parseInt(raw);
+            if (isNaN(num)) continue;
+            historyRecords.push({
+                issue: period,
+                number: num,
+                type: typeFor(num),
+                color: colorFor(num),
                 predNum: item.pred_num ?? null,
-                status: item.status || "PENDING"
-            }));
-            runDeepDataAnalysis();
+                status: item.status || 'PENDING'
+            });
         }
-    } catch (e) {}
+        sortDesc();
+        if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
+        console.log(`Loaded ${historyRecords.length} real records from Supabase.`);
+        runDeepDataAnalysis();
+    } catch (e) {
+        console.log('Load exception:', e.message);
+    }
 }
 
+// ============================================================
+// === ANALYSIS (NULL-safe) ===
+// ============================================================
 function runDeepDataAnalysis() {
-    if (!historyRecords || historyRecords.length === 0) return;
-
-    let total = historyRecords.length;
-    let bigCount = 0;
-    let smallCount = 0;
+    if (!historyRecords.length) return;
+    let total = 0, bigCount = 0, smallCount = 0;
     let numFreq = Array(10).fill(0);
-    let totalWins = 0;
-    let evaluatedPreds = 0;
+    let totalWins = 0, evaluated = 0;
 
     historyRecords.forEach(item => {
-        if (item.type === "Big") bigCount++;
-        else smallCount++;
-
-        if (item.number >= 0 && item.number <= 9) {
-            numFreq[item.number]++;
-        }
-
-        if (item.status === "WIN") {
-            totalWins++;
-            evaluatedPreds++;
-        } else if (item.status === "LOSS") {
-            evaluatedPreds++;
-        }
+        if (item.number === null || item.number === undefined) return;
+        total++;
+        if (item.type === 'Big') bigCount++; else smallCount++;
+        if (item.number >= 0 && item.number <= 9) numFreq[item.number]++;
+        if (item.status === 'WIN') { totalWins++; evaluated++; }
+        else if (item.status === 'LOSS') { evaluated++; }
     });
+    if (!total) return;
 
-    let maxFreq = -1;
-    let minFreq = Infinity;
-    let hotNum = 0;
-    let overdueNum = 0;
-
+    let maxFreq = -1, minFreq = Infinity, hotNum = 0, dueNum = 0;
     numFreq.forEach((freq, num) => {
-        if (freq > maxFreq) {
-            maxFreq = freq;
-            hotNum = num;
-        }
-        if (freq < minFreq) {
-            minFreq = freq;
-            overdueNum = num;
-        }
+        if (freq > maxFreq) { maxFreq = freq; hotNum = num; }
+        if (freq < minFreq) { minFreq = freq; dueNum = num; }
     });
 
     analyticsStats = {
@@ -243,157 +287,227 @@ function runDeepDataAnalysis() {
         bigPercent: ((bigCount / total) * 100).toFixed(1),
         smallPercent: ((smallCount / total) * 100).toFixed(1),
         hotNumber: hotNum,
-        overdueNumber: overdueNum,
-        winRate: evaluatedPreds > 0 ? ((totalWins / evaluatedPreds) * 100).toFixed(1) : "0.0"
+        overdueNumber: dueNum,
+        winRate: evaluated > 0 ? ((totalWins / evaluated) * 100).toFixed(1) : '0.0'
     };
 }
 
-app.get('/', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Facing AI Pattern Matcher Tool - Milu</title>
-        <style>
-            body { font-family: Arial, sans-serif; background-color: #121212; color: #ffffff; text-align: center; padding: 15px; margin: 0; }
-            .container { max-width: 460px; margin: 15px auto; background: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0,0,0,0.6); }
-            h2 { color: #00e676; margin-bottom: 15px; font-size: 22px; }
-            .timer-box { font-size: 24px; font-weight: bold; color: #ff9800; margin: 10px 0; background: #2a2a2a; padding: 8px; border-radius: 8px; }
-            .period-box { font-size: 16px; color: #b0bec5; margin-bottom: 10px; }
-            .analytics-card { background: #1a232a; border: 1px solid #00b0ff; border-radius: 8px; padding: 10px; margin: 12px 0; font-size: 13px; text-align: left; }
-            .analytics-card h4 { margin: 0 0 8px 0; color: #00b0ff; text-align: center; }
-            .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-            .stat-item { background: #252d35; padding: 6px 8px; border-radius: 4px; }
-            .prediction-card { background: #252525; border: 2px solid #00e676; padding: 15px; border-radius: 8px; margin: 15px 0; }
-            .prediction-card h3 { margin: 0 0 8px 0; color: #00e676; font-size: 16px; }
-            .pred-num-box { font-size: 40px; font-weight: bold; color: #00e676; margin: 5px 0; }
-            .pred-details { font-size: 15px; color: #ffffff; font-weight: bold; }
-            .history-container { margin-top: 20px; text-align: left; background: #252525; padding: 12px; border-radius: 8px; max-height: 250px; overflow-y: auto; border: 1px solid #333; }
-            .history-container h3 { margin-top: 0; font-size: 15px; color: #90caf9; border-bottom: 1px solid #444; padding-bottom: 6px; }
-            .history-item { padding: 8px 6px; border-bottom: 1px solid #333; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
-            .badge-big { background: #4caf50; color: white; padding: 2px 5px; border-radius: 3px; }
-            .badge-small { background: #ff5252; color: white; padding: 2px 5px; border-radius: 3px; }
-            .status-win { background: #2e7d32; color: #fff; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-            .status-loss { background: #c62828; color: #fff; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Facing AI Pattern Tool - Milu</h2>
-            <div class="period-box">Target Period: <span id="periodNumber" style="color: #fff; font-weight: bold;">Loading...</span></div>
-            <div class="timer-box">Time Left: <span id="timer">30</span>s</div>
-            <div class="analytics-card">
-                <h4>2000 Records Deep Analysis</h4>
-                <div class="stats-grid">
-                    <div class="stat-item">Analyzed: <b id="statTotal" style="color:#00e676;">0</b></div>
-                    <div class="stat-item">Win Rate: <b id="statWinRate" style="color:#ffb74d;">0%</b></div>
-                    <div class="stat-item">Big/Small: <b id="statRatio">0% / 0%</b></div>
-                    <div class="stat-item">Hot/Due: <b id="statHotDue" style="color:#29b6f6;">- / -</b></div>
-                </div>
-            </div>
-            <div class="prediction-card">
-                <h3>Next Expected Number Prediction</h3>
-                <div class="pred-num-box" id="predNum">-</div>
-                <div class="pred-details">
-                    Type: <span id="predType" style="color:#00b0ff;">-</span> | Color: <span id="predColor">-</span>
-                </div>
-            </div>
-            <div class="history-container">
-                <h3>Live History & Win/Loss Status</h3>
-                <div id="historyList">Loading history...</div>
-            </div>
-        </div>
-        <script src="/socket.io/socket.io.js"></script>
-        <script>
-            const socket = io();
-            socket.on('timerUpdate', (data) => {
-                if (data.periodNumber && data.periodNumber !== "Loading...") {
-                    document.getElementById('periodNumber').innerText = data.periodNumber;
-                }
-                if (data.countdown !== undefined) {
-                    document.getElementById('timer').innerText = data.countdown;
-                }
-                if (data.analytics) {
-                    document.getElementById('statTotal').innerText = data.analytics.totalAnalyzed;
-                    document.getElementById('statWinRate').innerText = data.analytics.winRate + '%';
-                    document.getElementById('statRatio').innerText = data.analytics.bigPercent + '% / ' + data.analytics.smallPercent + '%';
-                    document.getElementById('statHotDue').innerText = 'Hot:' + data.analytics.hotNumber + ' | Due:' + data.analytics.overdueNumber;
-                }
-                if (data.prediction) {
-                    document.getElementById('predNum').innerText = data.prediction.suggestedNum;
-                    document.getElementById('predType').innerText = data.prediction.suggestedType;
-                    document.getElementById('predColor').innerText = data.prediction.suggestedColor;
-                    document.getElementById('predColor').style.color = data.prediction.suggestedColor === 'Red' ? '#ff5252' : '#4caf50';
-                }
-                if (data.history && data.history.length > 0) {
-                    let html = '';
-                    data.history.forEach(item => {
-                        const badgeClass = item.type === 'Big' ? 'badge-big' : 'badge-small';
-                        let statusHtml = '<span style="color:#aaa;">Pending</span>';
-                        if (item.status === 'WIN') statusHtml = '<span class="status-win">WIN</span>';
-                        else if (item.status === 'LOSS') statusHtml = '<span class="status-loss">LOSS</span>';
-                        html += \`<div class="history-item">
-                            <span><b>\${String(item.issue).slice(-4)}</b></span>
-                            <span>Res: <b>\${item.number}</b> <span class="\${badgeClass}">\${item.type}</span></span>
-                            <span>Pred: \${item.predNum ?? '-'}</span>
-                            <span>\${statusHtml}</span>
-                        </div>\`;
-                    });
-                    document.getElementById('historyList').innerHTML = html;
-                }
-            });
-        </script>
-    </body>
-    </html>
-    `);
-});
+// ============================================================
+// === NEW PREDICTION ENGINE ===
+// ============================================================
+function computeChances(history) {
+    if (!history.length) return { big: 0.5, small: 0.5, streak: 0, streakType: null };
 
-let currentRound = {
-    periodNumber: "Loading...",
-    countdown: 30,
-    livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
-};
+    const longW = history.slice(0, Math.min(500, history.length));
+    let b = 0, s = 0;
+    longW.forEach(h => h.type === 'Big' ? b++ : s++);
+    const baseBig = (b + s) ? b / (b + s) : 0.5;
 
-// Smart Big/Small Pattern Matcher based on 2000 Records
-function generateProbabilityPattern(periodStr, history) {
-    if (!history || history.length < 5) return { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" };
+    const recentW = history.slice(0, Math.min(30, history.length));
+    let rb = 0, rs = 0;
+    recentW.forEach(h => h.type === 'Big' ? rb++ : rs++);
+    const recentBig = (rb + rs) ? rb / (rb + rs) : 0.5;
 
-    let recentTypes = history.slice(0, 5).map(h => h.type);
-    let countBig = recentTypes.filter(t => t === 'Big').length;
-    let countSmall = recentTypes.filter(t => t === 'Small').length;
+    let streakType = history[0].type, streak = 0;
+    for (const h of history) { if (h.type === streakType) streak++; else break; }
 
-    let predictedType = "Big";
+    let score = (baseBig - 0.5) * 0.8 + (recentBig - 0.5) * 1.2;
+    if (streak >= 4) score += (streakType === 'Big' ? -0.30 : 0.30);
+    else if (streak >= 2) score += (streakType === 'Big' ? -0.10 : 0.10);
 
-    // Streak / Trend follower logic
-    if (recentTypes[0] === recentTypes[1] && recentTypes[1] === recentTypes[2]) {
-        predictedType = recentTypes[0];
-    } else if (recentTypes[0] !== recentTypes[1] && recentTypes[1] !== recentTypes[2]) {
-        predictedType = recentTypes[0] === 'Big' ? 'Small' : 'Big';
-    } else {
-        predictedType = countBig > countSmall ? 'Small' : 'Big';
-    }
-
-    let suggestedNum = 7;
-    if (predictedType === "Big") {
-        let bigNums = [5, 6, 7, 8, 9];
-        suggestedNum = bigNums[Math.floor(Math.random() * bigNums.length)];
-    } else {
-        let smallNums = [0, 1, 2, 3, 4];
-        suggestedNum = smallNums[Math.floor(Math.random() * smallNums.length)];
-    }
-
-    let color = suggestedNum % 2 === 0 ? "Red" : "Green";
-    return { suggestedNum: suggestedNum, suggestedType: predictedType, suggestedColor: color };
+    let bigChance = 0.5 + Math.max(-0.35, Math.min(0.35, score));
+    bigChance = Math.max(0.15, Math.min(0.85, bigChance));
+    return { big: bigChance, small: 1 - bigChance, streak, streakType };
 }
 
+function pickNumberInRange(low, high, history, periodStr) {
+    const freq = {};
+    for (let n = low; n <= high; n++) freq[n] = 0;
+    history.slice(0, 300).forEach(h => {
+        if (h.number >= low && h.number <= high) freq[h.number]++;
+    });
+
+    const sorted = Object.keys(freq).map(Number).sort((a, b) => freq[b] - freq[a]);
+    const last = history[0] && history[0].number;
+
+    let seed = 0;
+    try { seed = Number(BigInt(periodStr) % 100n); } catch (e) { seed = parseInt(periodStr.slice(-2)) || 0; }
+
+    let pick = sorted.find(n => n !== last);
+    if (pick === undefined) pick = sorted[0];
+
+    if (seed % 3 === 0) {
+        pick = sorted[seed % sorted.length];
+        if (pick === last) pick = sorted[(seed + 1) % sorted.length];
+    }
+    return pick;
+}
+
+function generatePrediction(periodStr, history) {
+    const ch = computeChances(history);
+    const goBig = ch.big >= ch.small;
+    const low = goBig ? 5 : 0;
+    const high = goBig ? 9 : 4;
+    const num = pickNumberInRange(low, high, history, periodStr);
+
+    return {
+        suggestedNum: num,
+        suggestedType: goBig ? 'Big' : 'Small',
+        suggestedColor: colorFor(num),
+        bigChance: (ch.big * 100).toFixed(1),
+        smallChance: (ch.small * 100).toFixed(1)
+    };
+}
+
+function setPredictionFor(period) {
+    if (savedPredictions[period] === undefined) {
+        const np = generatePrediction(period, historyRecords);
+        currentRound.livePrediction = np;
+        savedPredictions[period] = np.suggestedNum;
+        persistPrediction(period, np.suggestedNum);
+    } else {
+        const p = savedPredictions[period];
+        currentRound.livePrediction = {
+            suggestedNum: p,
+            suggestedType: typeFor(p),
+            suggestedColor: colorFor(p),
+            bigChance: currentRound.livePrediction ? currentRound.livePrediction.bigChance : '-',
+            smallChance: currentRound.livePrediction ? currentRound.livePrediction.smallChance : '-'
+        };
+    }
+}
+
+// ============================================================
+// === FRONTEND ===
+// ============================================================
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Facing AI Pattern Matcher Tool - Milu</title>
+<style>
+body { font-family: Arial, sans-serif; background:#121212; color:#fff; text-align:center; padding:15px; margin:0; }
+.container { max-width:460px; margin:15px auto; background:#1e1e1e; padding:20px; border-radius:12px; box-shadow:0 6px 15px rgba(0,0,0,.6); }
+h2 { color:#00e676; margin-bottom:15px; font-size:22px; }
+.timer-box { font-size:24px; font-weight:bold; color:#ff9800; margin:10px 0; background:#2a2a2a; padding:8px; border-radius:8px; }
+.period-box { font-size:16px; color:#b0bec5; margin-bottom:10px; }
+.analytics-card { background:#1a232a; border:1px solid #00b0ff; border-radius:8px; padding:10px; margin:12px 0; font-size:13px; text-align:left; }
+.analytics-card h4 { margin:0 0 8px 0; color:#00b0ff; text-align:center; }
+.stats-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.stat-item { background:#252d35; padding:6px 8px; border-radius:4px; }
+.prediction-card { background:#252525; border:2px solid #00e676; padding:15px; border-radius:8px; margin:15px 0; }
+.prediction-card h3 { margin:0 0 8px 0; color:#00e676; font-size:16px; }
+.pred-num-box { font-size:40px; font-weight:bold; color:#00e676; margin:5px 0; }
+.pred-details { font-size:15px; color:#fff; font-weight:bold; }
+.chance-bar { height:10px; background:#333; border-radius:5px; margin:8px 0; overflow:hidden; display:flex; }
+.chance-big { background:#4caf50; }
+.chance-small { background:#ff5252; }
+.history-container { margin-top:20px; text-align:left; background:#252525; padding:12px; border-radius:8px; max-height:250px; overflow-y:auto; border:1px solid #333; }
+.history-container h3 { margin-top:0; font-size:15px; color:#90caf9; border-bottom:1px solid #444; padding-bottom:6px; }
+.history-item { padding:8px 6px; border-bottom:1px solid #333; font-size:12px; display:flex; justify-content:space-between; align-items:center; }
+.badge-big { background:#4caf50; color:#fff; padding:2px 5px; border-radius:3px; }
+.badge-small { background:#ff5252; color:#fff; padding:2px 5px; border-radius:3px; }
+.badge-violet { background:#9c27b0; color:#fff; padding:2px 5px; border-radius:3px; }
+.status-win { background:#2e7d32; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; }
+.status-loss { background:#c62828; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h2>Facing AI Pattern Tool - Milu</h2>
+    <div class="period-box">Target Period: <span id="periodNumber" style="color:#fff;font-weight:bold;">Loading...</span></div>
+    <div class="timer-box">Time Left: <span id="timer">30</span>s</div>
+
+    <div class="analytics-card">
+        <h4>2000 Records Deep Analysis</h4>
+        <div class="stats-grid">
+            <div class="stat-item">Analyzed: <b id="statTotal" style="color:#00e676;">0</b></div>
+            <div class="stat-item">Win Rate: <b id="statWinRate" style="color:#ffb74d;">0%</b></div>
+            <div class="stat-item">Big/Small: <b id="statRatio">0% / 0%</b></div>
+            <div class="stat-item">Hot/Due: <b id="statHotDue" style="color:#29b6f6;">- / -</b></div>
+        </div>
+    </div>
+
+    <div class="prediction-card">
+        <h3>Next Expected Number</h3>
+        <div class="pred-num-box" id="predNum">-</div>
+        <div class="pred-details">
+            Type: <span id="predType" style="color:#00b0ff;">-</span> | Color: <span id="predColor">-</span>
+        </div>
+        <div style="font-size:12px;color:#aaa;margin-top:8px;">
+            Big <b id="bigPct" style="color:#4caf50;">0%</b> / Small <b id="smallPct" style="color:#ff5252;">0%</b>
+        </div>
+        <div class="chance-bar"><div class="chance-big" id="bigBar" style="width:50%"></div><div class="chance-small" id="smallBar" style="width:50%"></div></div>
+    </div>
+
+    <div class="history-container">
+        <h3>Live History & Win/Loss Status</h3>
+        <div id="historyList">Loading history...</div>
+    </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io();
+
+socket.on('timerUpdate', (data) => {
+    if (data.periodNumber && data.periodNumber !== 'Loading...') {
+        document.getElementById('periodNumber').innerText = data.periodNumber;
+    }
+    if (data.countdown !== undefined) {
+        document.getElementById('timer').innerText = data.countdown;
+    }
+    if (data.analytics) {
+        document.getElementById('statTotal').innerText = data.analytics.totalAnalyzed;
+        document.getElementById('statWinRate').innerText = data.analytics.winRate + '%';
+        document.getElementById('statRatio').innerText = data.analytics.bigPercent + '% / ' + data.analytics.smallPercent + '%';
+        document.getElementById('statHotDue').innerText = 'Hot:' + data.analytics.hotNumber + ' | Due:' + data.analytics.overdueNumber;
+    }
+    if (data.prediction) {
+        document.getElementById('predNum').innerText = data.prediction.suggestedNum;
+        document.getElementById('predType').innerText = data.prediction.suggestedType;
+        const pc = document.getElementById('predColor');
+        pc.innerText = data.prediction.suggestedColor;
+        pc.style.color = data.prediction.suggestedColor === 'Red' ? '#ff5252'
+                        : data.prediction.suggestedColor === 'Green' ? '#4caf50' : '#ba68c8';
+        const bp = parseFloat(data.prediction.bigChance) || 0;
+        document.getElementById('bigPct').innerText = data.prediction.bigChance + '%';
+        document.getElementById('smallPct').innerText = data.prediction.smallChance + '%';
+        document.getElementById('bigBar').style.width = bp + '%';
+        document.getElementById('smallBar').style.width = (100 - bp) + '%';
+    }
+    if (data.history) {
+        let html = '';
+        data.history.forEach(item => {
+            const badgeClass = item.color === 'Violet' ? 'badge-violet' : (item.type === 'Big' ? 'badge-big' : 'badge-small');
+            let statusHtml = '<span style="color:#aaa;">Pending</span>';
+            if (item.status === 'WIN') statusHtml = '<span class="status-win">WIN</span>';
+            else if (item.status === 'LOSS') statusHtml = '<span class="status-loss">LOSS</span>';
+            html += '<div class="history-item">' +
+                '<span><b>' + String(item.issue).slice(-4) + '</b></span>' +
+                '<span>Res: <b>' + item.number + '</b> <span class="' + badgeClass + '">' + item.type + '</span></span>' +
+                '<span>Pred: ' + (item.predNum ?? '-') + '</span>' +
+                '<span>' + statusHtml + '</span></div>';
+        });
+        document.getElementById('historyList').innerHTML = html;
+    }
+});
+</script>
+</body>
+</html>`);
+});
+
+// ============================================================
+// === MAIN SYNC ===
+// ============================================================
 async function fetchDamanApiData() {
     if (isFetching) return;
     isFetching = true;
-
     try {
         const json = await fetchRawApi();
+
         if (!json) {
             usingFallback = true;
             await fetchFallback();
@@ -401,130 +515,88 @@ async function fetchDamanApiData() {
         }
         usingFallback = false;
 
-        let listArray = extractList(json);
-
+        const listArray = extractList(json);
         if (Array.isArray(listArray) && listArray.length > 0) {
-            for (let item of listArray) {
+            for (const item of listArray) {
                 const iss = String(item.issueNumber || item.issue || '');
                 const num = parseInt(item.number ?? item.winningNumber ?? item.price ?? item.sum);
+                if (!iss || isNaN(num)) continue;
 
-                if (iss && !isNaN(num)) {
-                    const type = num >= 5 ? "Big" : "Small";
-                    const color = num % 2 === 0 ? "Red" : "Green";
+                const type = typeFor(num);
+                const color = colorFor(num);
+                const existing = historyRecords.find(h => h.issue === iss);
+                const pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
+                const status = pNum !== null ? (pNum === num ? 'WIN' : 'LOSS') : 'PENDING';
 
-                    let existing = historyRecords.find(h => h.issue === iss);
-                    let pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
-                    
-                    // Big/Small based Win/Loss evaluation
-                    let status = "PENDING";
+                if (!existing) {
+                    historyRecords.push({ issue: iss, number: num, type, color, predNum: pNum, status });
+                    await persistResult(iss, num, pNum, status);
+                } else {
+                    existing.number = num;
+                    existing.type = type;
+                    existing.color = color;
                     if (pNum !== null) {
-                        let predType = pNum >= 5 ? "Big" : "Small";
-                        status = (predType === type) ? "WIN" : "LOSS";
+                        existing.predNum = pNum;
+                        existing.status = (pNum === num) ? 'WIN' : 'LOSS';
                     }
-
-                    if (!existing) {
-                        historyRecords.push({
-                            issue: iss,
-                            number: num,
-                            type: type,
-                            color: color,
-                            predNum: pNum,
-                            status: status
-                        });
-
-                        await supabase.from('test_results').upsert({
-                            period_number: iss,
-                            results: String(num),
-                            pred_num: pNum,
-                            status: status
-                        }, { onConflict: ['period_number'] });
-
-                    } else {
-                        existing.number = num;
-                        existing.type = type;
-                        existing.color = color;
-                        if (pNum !== null) {
-                            existing.predNum = pNum;
-                            let predType = pNum >= 5 ? "Big" : "Small";
-                            existing.status = (predType === type) ? "WIN" : "LOSS";
-                        }
-
-                        await supabase.from('test_results').upsert({
-                            period_number: iss,
-                            results: String(num),
-                            pred_num: existing.predNum,
-                            status: existing.status
-                        }, { onConflict: ['period_number'] });
-                    }
+                    await persistResult(iss, num, existing.predNum, existing.status);
                 }
             }
         }
 
-        historyRecords.sort((a, b) => b.issue.localeCompare(a.issue));
+        sortDesc();
         if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
-
         runDeepDataAnalysis();
 
         if (historyRecords.length > 0) {
-            let latestIssue = BigInt(historyRecords[0].issue);
-            let nextIssueStr = (latestIssue + 1n).toString();
-
+            const nextIssueStr = (BigInt(historyRecords[0].issue) + 1n).toString();
             if (nextIssueStr !== lastProcessedPeriod) {
                 lastProcessedPeriod = nextIssueStr;
                 currentRound.periodNumber = nextIssueStr;
-                currentRound.countdown = 30;
-
-                if (savedPredictions[nextIssueStr] === undefined) {
-                    let newPred = generateProbabilityPattern(nextIssueStr, historyRecords);
-                    currentRound.livePrediction = newPred;
-                    savedPredictions[nextIssueStr] = newPred.suggestedNum;
-                } else {
-                    let pNum = savedPredictions[nextIssueStr];
-                    let targetType = pNum >= 5 ? "Big" : "Small";
-                    let color = pNum % 2 === 0 ? "Red" : "Green";
-                    currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
-                }
+                currentRound.countdown = PERIOD_SECONDS;
+                setPredictionFor(nextIssueStr);
             }
         }
     } catch (e) {
+        console.error('API Parse Error:', e.message);
     } finally {
         isFetching = false;
     }
 }
 
-function startSyncLoop() {
+// countdown tick (1s) — STOP BYPASS ke saath
+function startCountdownLoop() {
     setInterval(() => {
-        fetchDamanApiData();
-
         if (currentRound.countdown > 0) {
             currentRound.countdown--;
         } else {
-            currentRound.countdown = 30;
-            if (usingFallback) {
-                try {
-                    currentRound.periodNumber = (BigInt(currentRound.periodNumber) + 1n).toString();
-                    if (savedPredictions[currentRound.periodNumber] === undefined) {
-                        const np = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
-                        currentRound.livePrediction = np;
-                        savedPredictions[currentRound.periodNumber] = np.suggestedNum;
-                    }
-                } catch (e) {}
-            }
+            currentRound.countdown = PERIOD_SECONDS;
+            try {
+                currentRound.periodNumber = (BigInt(currentRound.periodNumber) + 1n).toString();
+                setPredictionFor(currentRound.periodNumber);
+            } catch (e) {}
         }
-
         io.emit('timerUpdate', {
             periodNumber: currentRound.periodNumber,
             countdown: currentRound.countdown,
             prediction: currentRound.livePrediction,
             analytics: analyticsStats,
-            history: historyRecords
+            history: historyRecords.slice(0, 40)
         });
     }, 1000);
 }
 
-loadHistoryFromSupabase().then(() => {
-    server.listen(PORT, () => {
-        console.log(`Server running at http://localhost:${PORT}`);
-        startSyncLoop();
+function startPollLoop() {
+    setInterval(fetchDamanApiData, POLL_MS);
+}
+
+loadHistoryFromSupabase()
+    .catch(e => console.error('Load failed:', e))
+    .finally(() => {
+        server.listen(PORT, () => {
+            console.log(`Facing AI Server on http://localhost:${PORT} | real history + prediction engine ON`);
+            fetchDamanApiData();
+            startCountdownLoop();
+            startPollLoop();
+        });
     });
-});
