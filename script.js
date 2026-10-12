@@ -39,10 +39,9 @@ let analyticsStats = {
     winRate: "0.0"
 };
 
-// === FETCH DATA VIA PROXY WORKER (RENDER ENV VARIABLE) ===
+// === FETCH DATA VIA PROXY WORKER ===
 function fetchDamanApiData() {
     return new Promise((resolve, reject) => {
-        // Yeh Render ke Environment Variable (PROXY_WORKER) ka use karega
         const proxyUrl = process.env.PROXY_WORKER || 'https://wingo-proxy.kingmilu676.workers.dev';
         const url = `${proxyUrl}?ts=${Date.now()}`;
 
@@ -50,7 +49,8 @@ function fetchDamanApiData() {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'application/json'
-            }
+            },
+            timeout: 10000
         }, (res) => {
             let rawData = '';
 
@@ -60,7 +60,13 @@ function fetchDamanApiData() {
 
             res.on('end', () => {
                 try {
-                    const parsedData = JSON.parse(rawData);
+                    let cleanedData = rawData.trim();
+                    // Fix malformed JSON if missing leading curly brace
+                    if (cleanedData.startsWith('"data"') || cleanedData.startsWith('data:')) {
+                        cleanedData = '{' + cleanedData + '}';
+                    }
+                    
+                    const parsedData = JSON.parse(cleanedData);
                     if (parsedData && parsedData.data && parsedData.data.list) {
                         resolve(parsedData.data.list);
                     } else if (Array.isArray(parsedData)) {
@@ -74,7 +80,7 @@ function fetchDamanApiData() {
                 }
             });
         }).on('error', (err) => {
-            console.error("Proxy Fetch Error:", err.message);
+            console.error("Proxy Connection Error:", err.message);
             resolve(null);
         });
     });
@@ -197,7 +203,7 @@ async function updateLiveGameData() {
             runDeepDataAnalysis();
         }
     } catch (err) {
-        console.error("Game sync error:", err.message);
+        console.error("Live game sync error:", err.message);
     }
 }
 
