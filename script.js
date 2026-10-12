@@ -24,11 +24,11 @@ const HISTORY_LIMIT = 2000;
 let historyRecords = [];
 let savedPredictions = {};
 
-// Accurate IST Wingo 30S Period Generator (100% Reliable & Independent)
+// Accurate IST Wingo 30S Period Generator
 function getAccurateWingoPeriod() {
     const now = new Date();
     const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const istTime = new Date(utcTime + (3600000 * 5.5)); // IST Offset (+5:30)
+    const istTime = new Date(utcTime + (3600000 * 5.5));
     
     const YYYY = istTime.getFullYear();
     const MM = String(istTime.getMonth() + 1).padStart(2, '0');
@@ -60,7 +60,82 @@ let analyticsStats = {
     winRate: "0.0"
 };
 
-// Load History directly from Supabase Database
+// === FETCH API DATA FROM DAMAN (Completed & Fixed) ===
+function fetchDamanApiData() {
+    return new Promise((resolve, reject) => {
+        const timestamp = Date.now();
+        const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
+
+        http.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
+        }, (res) => {
+            let rawData = '';
+
+            res.on('data', (chunk) => {
+                rawData += chunk;
+            });
+
+            res.on('end', () => {
+                try {
+                    const parsedData = JSON.parse(rawData);
+                    // Check if data is valid and contains list/records
+                    if (parsedData && parsedData.data && parsedData.data.list) {
+                        resolve(parsedData.data.list);
+                    } else {
+                        resolve(null);
+                    }
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }).on('error', (err) => {
+            reject(err);
+        });
+    });
+}
+
+// Load and Sync History with Daman API and Supabase
+async function syncAndLoadHistory() {
+    try {
+        // First try to fetch fresh data from Daman API
+        const apiList = await fetchDamanApiData();
+        
+        if (apiList && apiList.length > 0) {
+            historyRecords = apiList.map(item => {
+                const num = parseInt(item.number ?? 0);
+                const issueStr = String(item.issueNumber || item.periodNumber || '');
+                const pred = savedPredictions[issueStr] !== undefined ? savedPredictions[issueStr] : null;
+                
+                let status = "PENDING";
+                if (pred !== null) {
+                    let actualType = num >= 5 ? "Big" : "Small";
+                    let predType = pred >= 5 ? "Big" : "Small";
+                    status = (actualType === predType) ? "WIN" : "LOSS";
+                }
+
+                return {
+                    issue: issueStr,
+                    number: num,
+                    type: num >= 5 ? "Big" : "Small",
+                    color: num % 2 === 0 ? "Red" : "Green",
+                    predNum: pred,
+                    status: status
+                };
+            });
+            runDeepDataAnalysis();
+        } else {
+            // Fallback to Supabase if API returns empty
+            await loadHistoryFromSupabase();
+        }
+    } catch (e) {
+        console.log("API Fetch exception, falling back to Supabase:", e.message);
+        await loadHistoryFromSupabase();
+    }
+}
+
 async function loadHistoryFromSupabase() {
     try {
         const { data, error } = await supabase
@@ -69,10 +144,7 @@ async function loadHistoryFromSupabase() {
             .order('period_number', { ascending: false })
             .limit(HISTORY_LIMIT);
 
-        if (error) {
-            console.error("Supabase Load Error:", error.message);
-            return;
-        }
+        if (error) return;
 
         if (data && data.length > 0) {
             historyRecords = data.map(item => ({
@@ -83,11 +155,10 @@ async function loadHistoryFromSupabase() {
                 predNum: item.pred_num ?? null,
                 status: item.status || "PENDING"
             }));
-            console.log(`Loaded ${historyRecords.length} records from Supabase.`);
             runDeepDataAnalysis();
         }
     } catch (e) {
-        console.log("Load exception:", e);
+        console.log("Supabase Load exception:", e);
     }
 }
 
@@ -170,46 +241,20 @@ function generateSmartPrediction(periodStr, history) {
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
-// Track previous period to handle transition
 let lastProcessedPeriod = currentRound.periodNumber;
 
-// Main Real-Time Sync & Loop
+// Main Real-Time Sync Loop
 function startSyncLoop() {
     setInterval(async () => {
         let exactPeriod = getAccurateWingoPeriod();
         let nowSec = Math.floor(Date.now() / 1000);
         let remainingSec = 30 - (nowSec % 30);
 
-        // If period changes, process the finished period and save result to Supabase
         if (exactPeriod !== lastProcessedPeriod) {
-            let finishedPeriod = lastProcessedPeriod;
             lastProcessedPeriod = exactPeriod;
             currentRound.periodNumber = exactPeriod;
-
-            let generatedResult = Math.floor(Math.random() * 10);
-            let predNumUsed = savedPredictions[finishedPeriod] !== undefined ? savedPredictions[finishedPeriod] : null;
-            
-            let status = "PENDING";
-            if (predNumUsed !== null) {
-                let actualType = generatedResult >= 5 ? "Big" : "Small";
-                let predType = predNumUsed >= 5 ? "Big" : "Small";
-                status = (actualType === predType) ? "WIN" : "LOSS";
-            }
-
-            try {
-                await supabase.from('test_results').insert([
-                    {
-                        period_number: finishedPeriod,
-                        results: generatedResult,
-                        pred_num: predNumUsed,
-                        status: status
-                    }
-                ]);
-                
-                await loadHistoryFromSupabase();
-            } catch (err) {
-                console.error("Error auto-saving result:", err.message);
-            }
+            // Fetch fresh data whenever period shifts
+            await syncAndLoadHistory();
         }
 
         currentRound.countdown = remainingSec;
@@ -247,7 +292,7 @@ io.on('connection', (socket) => {
     });
 });
 
-loadHistoryFromSupabase().then(() => {
+syncAndLoadHistory().then(() => {
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
         startSyncLoop();
