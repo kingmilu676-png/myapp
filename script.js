@@ -27,6 +27,8 @@ const HISTORY_LIMIT = 2000;
 let historyRecords = [];
 let savedPredictions = {};
 let lastProcessedPeriod = null;
+let usingFallback = false;
+let isFetching = false;
 
 // Analytics Stats Object
 let analyticsStats = {
@@ -39,12 +41,16 @@ let analyticsStats = {
 };
 
 // ============================================================
-// === ROBUST API FETCH (ORIGIN + PROXIES + FALLBACK) =========
+// === ROBUST API FETCH (BYPASS + ORIGIN + PROXIES + FALLBACK)
 // ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
 
-// Origin ab server/cloud IPs ko 403 deta hai -> proxy + fallback zaroori
+// FREE KEY: scraperapi.com se le kar Render Environment me SCRAPERAPI_KEY daal do
+const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY || '';
+
+// Origin Cloudflare/WAF ke peeche hai -> datacenter IPs ko 403 deta hai.
+// Isliye browser-impersonating service + proxies + fallback.
 const PROXIES = [
     (u) => 'https://proxy.cors.dev/' + u,
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -64,7 +70,7 @@ const API_HEADERS = {
 
 function httpGetText(url, redirectsLeft = 5) {
     return new Promise((resolve, reject) => {
-        const req = https.get(url, { headers: API_HEADERS, timeout: 12000 }, (res) => {
+        const req = https.get(url, { headers: API_HEADERS, timeout: 15000 }, (res) => {
             const status = res.statusCode;
             if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
                 res.resume();
@@ -130,10 +136,21 @@ function extractList(json) {
 
 async function fetchRawApi() {
     const target = `${API_BASE}?ts=${Date.now()}`;
-    const attempts = [
-        { name: 'direct', url: target },
-        ...PROXIES.map((p, i) => ({ name: `proxy${i + 1}`, url: p(target) }))
-    ];
+    const attempts = [];
+
+    // 1) Sabse pehle browser-impersonating bypass (403 clear karta hai, agar key set ho)
+    if (SCRAPERAPI_KEY) {
+        attempts.push({
+            name: 'scraperapi',
+            url: 'https://api.scraperapi.com/?api_key=' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target)
+        });
+    }
+
+    // 2) Direct origin
+    attempts.push({ name: 'direct', url: target });
+
+    // 3) Normal public proxies
+    PROXIES.forEach((p, i) => attempts.push({ name: `proxy${i + 1}`, url: p(target) }));
 
     for (const att of attempts) {
         try {
@@ -145,7 +162,6 @@ async function fetchRawApi() {
             }
             const json = tryParseJson(res.raw);
             if (!json) { console.log(`[API] ${att.name} not JSON: ${res.raw.slice(0, 80)}`); continue; }
-            // corsproxy key-error jaisa {"error":...} skip karo
             if (json.error && !(json.data && json.data.list)) {
                 console.log(`[API] ${att.name} error json: ${JSON.stringify(json).slice(0, 80)}`);
                 continue;
@@ -159,41 +175,23 @@ async function fetchRawApi() {
     return null;
 }
 
-// Fallback: indialotteryapi.com (no auth, datacenter se chalta hai)
+// Fallback: indialotteryapi.com (no auth) — sirf countdown drift sahi karta hai
 async function fetchFallback() {
     try {
-        // Sirf countdown ke liye API (period yahan se nahi lenge)
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
-        if (nx && typeof nx.remain === 'number') currentRound.countdown = nx.remain;
 
-        // Target period: history ke latest se +1 (consistent, dash-free)
-        if (historyRecords.length > 0) {
-            let next = null;
-            try { next = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
-            if (!next && nx && nx.period) next = String(nx.period).replace('-', '');
-
-            if (next) {
-                currentRound.periodNumber = next; // dash hata ke, history jaisa format
-
-                if (savedPredictions[next] === undefined) {
-                    const np = generateProbabilityPattern(next, historyRecords);
-                    currentRound.livePrediction = np;
-                    savedPredictions[next] = np.suggestedNum;
-                } else {
-                    const p = savedPredictions[next];
-                    currentRound.livePrediction = {
-                        suggestedNum: p,
-                        suggestedType: p >= 5 ? "Big" : "Small",
-                        suggestedColor: p % 2 === 0 ? "Red" : "Green"
-                    };
-                }
+        if (currentRound.periodNumber === "Loading...") {
+            if (historyRecords.length > 0) {
+                try { currentRound.periodNumber = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
             }
-        } else if (nx && nx.period) {
-            // history khaali ho to sirf API period, dash hata ke
-            currentRound.periodNumber = String(nx.period).replace('-', '');
+            if (currentRound.periodNumber === "Loading..." && nx && nx.period) {
+                currentRound.periodNumber = String(nx.period).replace('-', '');
+            }
         }
 
-        console.log(`[API] fallback OK period=${currentRound.periodNumber}`);
+        if (nx && typeof nx.remain === 'number' && Math.abs(nx.remain - currentRound.countdown) >= 2) {
+            currentRound.countdown = nx.remain;
+        }
         return true;
     } catch (e) {
         console.log('[API] fallback error:', e.message);
@@ -526,13 +524,19 @@ function generateProbabilityPattern(periodStr, history) {
 
 // Fetch Official API & Sync with Supabase
 async function fetchDamanApiData() {
-    const json = await fetchRawApi();
-    if (!json) {
-        await fetchFallback();
-        return;
-    }
+    if (isFetching) return; // overlap guard
+    isFetching = true;
 
     try {
+        const json = await fetchRawApi();
+
+        if (!json) {
+            usingFallback = true;
+            await fetchFallback();
+            return;
+        }
+        usingFallback = false;
+
         let listArray = extractList(json);
 
         if (Array.isArray(listArray) && listArray.length > 0) {
@@ -613,6 +617,8 @@ async function fetchDamanApiData() {
         }
     } catch (e) {
         console.error("API Parse Error:", e.message);
+    } finally {
+        isFetching = false;
     }
 }
 
@@ -621,9 +627,20 @@ function startSyncLoop() {
         fetchDamanApiData();
 
         if (currentRound.countdown > 0) {
-            currentRunCountdown = currentRound.countdown--;
+            currentRound.countdown--;
         } else {
+            // Timer khatam = naya period. Fallback me period khud aage badhao (stop na ho)
             currentRound.countdown = 30;
+            if (usingFallback) {
+                try {
+                    currentRound.periodNumber = (BigInt(currentRound.periodNumber) + 1n).toString();
+                    if (savedPredictions[currentRound.periodNumber] === undefined) {
+                        const np = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
+                        currentRound.livePrediction = np;
+                        savedPredictions[currentRound.periodNumber] = np.suggestedNum;
+                    }
+                } catch (e) { /* ignore */ }
+            }
         }
 
         io.emit('timerUpdate', {
