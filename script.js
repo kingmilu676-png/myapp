@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
 
@@ -36,6 +37,122 @@ let analyticsStats = {
     overdueNumber: "-",
     winRate: 0
 };
+
+// ============================================================
+// === ROBUST API FETCH (DIRECT + PROXY FALLBACK) =============
+// ============================================================
+const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
+
+// Render/cloud IP ko origin 403 ya HTML deta hai -> proxy fallback zaroori hai
+const PROXIES = [
+    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+    (u) => 'https://r.jina.ai/' + u,
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)
+];
+
+const API_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Origin': 'https://draw.ar-lottery01.com',
+    'Referer': 'https://draw.ar-lottery01.com/',
+    'Cache-Control': 'no-cache'
+};
+
+function httpGetText(url, redirectsLeft = 5) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, { headers: API_HEADERS, timeout: 12000 }, (res) => {
+            const status = res.statusCode;
+            if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
+                res.resume();
+                let next;
+                try { next = new URL(res.headers.location, url).toString(); }
+                catch (e) { return reject(e); }
+                return resolve(httpGetText(next, redirectsLeft - 1));
+            }
+            let stream = res;
+            const enc = (res.headers['content-encoding'] || '').toLowerCase();
+            try {
+                if (enc === 'gzip') stream = res.pipe(zlib.createGunzip());
+                else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
+                else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
+            } catch (e) { /* ignore */ }
+            let raw = '';
+            stream.on('data', (c) => { raw += c.toString('utf8'); });
+            stream.on('end', () => resolve({ status, contentType: res.headers['content-type'] || '', raw }));
+            stream.on('error', reject);
+        });
+        req.on('timeout', () => req.destroy(new Error('Request timeout')));
+        req.on('error', reject);
+    });
+}
+
+function tryParseJson(text) {
+    if (!text) return null;
+    let t = text.trim().replace(/^\uFEFF/, '');
+    if (t.startsWith('```')) t = t.replace(/```json/gi, '').replace(/```/g, '').trim();
+    try { return JSON.parse(t); } catch (e) { /* continue */ }
+    const starts = [t.indexOf('{'), t.indexOf('[')].filter(x => x >= 0);
+    if (starts.length) {
+        const start = Math.min(...starts);
+        const end = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
+        if (end > start) {
+            try { return JSON.parse(t.slice(start, end + 1)); } catch (e) { /* continue */ }
+        }
+    }
+    return null;
+}
+
+function extractList(json) {
+    if (!json) return [];
+    const candidates = [
+        json.data && json.data.list,
+        json.data && json.data.data && json.data.data.list,
+        json.list,
+        json.data
+    ];
+    for (const c of candidates) if (Array.isArray(c)) return c;
+    let found = [];
+    (function walk(x) {
+        if (found.length) return;
+        if (Array.isArray(x)) {
+            if (x.some(v => v && typeof v === 'object')) { found = x; return; }
+            x.forEach(walk);
+        } else if (x && typeof x === 'object') {
+            Object.values(x).forEach(walk);
+        }
+    })(json);
+    return found;
+}
+
+async function fetchRawApi() {
+    const target = `${API_BASE}?ts=${Date.now()}`;
+    const attempts = [
+        { name: 'direct', url: target },
+        ...PROXIES.map((p, i) => ({ name: `proxy${i + 1}`, url: p(target) }))
+    ];
+
+    for (const att of attempts) {
+        try {
+            const res = await httpGetText(att.url);
+            const isHtml = /text\/html/i.test(res.contentType) || res.raw.trim().startsWith('<');
+            if (res.status >= 400 || isHtml) {
+                console.log(`[API] ${att.name} failed (status=${res.status}, html=${isHtml})`);
+                continue;
+            }
+            const json = tryParseJson(res.raw);
+            if (json) {
+                console.log(`[API] ${att.name} OK`);
+                return json;
+            }
+            console.log(`[API] ${att.name} not JSON: ${res.raw.slice(0, 80)}`);
+        } catch (e) {
+            console.log(`[API] ${att.name} error: ${e.message}`);
+        }
+    }
+    return null;
+}
+// ============================================================
 
 // Supabase se 2000 data load karein aur Analyze karein
 async function loadHistoryFromSupabase() {
@@ -330,6 +447,8 @@ let currentRound = {
     livePrediction: { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" }
 };
 
+let currentRunCountdown = 30; // (bug fix: pehle ye undeclared tha)
+
 // Smart Prediction Logic
 function generateProbabilityPattern(periodStr, history) {
     if (!history || history.length < 3) return { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" };
@@ -359,105 +478,94 @@ function generateProbabilityPattern(periodStr, history) {
 
 // Fetch Official API & Sync with Supabase
 async function fetchDamanApiData() {
-    const timestamp = Date.now();
-    const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
+    const json = await fetchRawApi();
+    if (!json) {
+        console.error("API Fetch Error: direct + all proxies failed");
+        return;
+    }
 
-    https.get(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-        }
-    }, (res) => {
-        let rawData = '';
-        res.on('data', (chunk) => { rawData += chunk; });
-        res.on('end', async () => {
-            try {
-                const json = JSON.parse(rawData);
-                const dataObj = json.data || json;
-                let listArray = dataObj.list || dataObj.data?.list || json.list || [];
+    try {
+        let listArray = extractList(json);
 
-                if (Array.isArray(listArray) && listArray.length > 0) {
-                    for (let item of listArray) {
-                        const iss = String(item.issueNumber || item.issue || '');
-                        const num = parseInt(item.number ?? item.winningNumber ?? item.price ?? item.sum);
+        if (Array.isArray(listArray) && listArray.length > 0) {
+            for (let item of listArray) {
+                const iss = String(item.issueNumber || item.issue || '');
+                const num = parseInt(item.number ?? item.winningNumber ?? item.price ?? item.sum);
 
-                        if (iss && !isNaN(num)) {
-                            const type = num >= 5 ? "Big" : "Small";
-                            const color = num % 2 === 0 ? "Red" : "Green";
+                if (iss && !isNaN(num)) {
+                    const type = num >= 5 ? "Big" : "Small";
+                    const color = num % 2 === 0 ? "Red" : "Green";
 
-                            let existing = historyRecords.find(h => h.issue === iss);
-                            let pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
-                            let status = pNum !== null ? (pNum === num ? "WIN" : "LOSS") : "PENDING";
+                    let existing = historyRecords.find(h => h.issue === iss);
+                    let pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
+                    let status = pNum !== null ? (pNum === num ? "WIN" : "LOSS") : "PENDING";
 
-                            if (!existing) {
-                                historyRecords.push({
-                                    issue: iss,
-                                    number: num,
-                                    type: type,
-                                    color: color,
-                                    predNum: pNum,
-                                    status: status
-                                });
+                    if (!existing) {
+                        historyRecords.push({
+                            issue: iss,
+                            number: num,
+                            type: type,
+                            color: color,
+                            predNum: pNum,
+                            status: status
+                        });
 
-                                await supabase.from('test_results').upsert({
-                                    period_number: iss,
-                                    results: String(num),
-                                    pred_num: pNum,
-                                    status: status
-                                }, { onConflict: ['period_number'] });
+                        await supabase.from('test_results').upsert({
+                            period_number: iss,
+                            results: String(num),
+                            pred_num: pNum,
+                            status: status
+                        }, { onConflict: ['period_number'] });
 
-                            } else {
-                                existing.number = num;
-                                existing.type = type;
-                                existing.color = color;
-                                if (pNum !== null) {
-                                    existing.predNum = pNum;
-                                    existing.status = (pNum === num) ? "WIN" : "LOSS";
-                                }
-
-                                await supabase.from('test_results').upsert({
-                                    period_number: iss,
-                                    results: String(num),
-                                    pred_num: existing.predNum,
-                                    status: existing.status
-                                }, { onConflict: ['period_number'] });
-                            }
+                    } else {
+                        existing.number = num;
+                        existing.type = type;
+                        existing.color = color;
+                        if (pNum !== null) {
+                            existing.predNum = pNum;
+                            existing.status = (pNum === num) ? "WIN" : "LOSS";
                         }
+
+                        await supabase.from('test_results').upsert({
+                            period_number: iss,
+                            results: String(num),
+                            pred_num: existing.predNum,
+                            status: existing.status
+                        }, { onConflict: ['period_number'] });
                     }
                 }
-
-                historyRecords.sort((a, b) => b.issue.localeCompare(a.issue));
-                if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
-
-                runDeepDataAnalysis();
-
-                if (historyRecords.length > 0) {
-                    let latestIssue = BigInt(historyRecords[0].issue);
-                    let nextIssueStr = (latestIssue + 1n).toString();
-
-                    if (nextIssueStr !== lastProcessedPeriod) {
-                        lastProcessedPeriod = nextIssueStr;
-                        currentRound.periodNumber = nextIssueStr;
-
-                        if (savedPredictions[nextIssueStr] === undefined) {
-                            let newPred = generateProbabilityPattern(nextIssueStr, historyRecords);
-                            currentRound.livePrediction = newPred;
-                            savedPredictions[nextIssueStr] = newPred.suggestedNum;
-                        } else {
-                            let pNum = savedPredictions[nextIssueStr];
-                            let targetType = pNum >= 5 ? "Big" : "Small";
-                            let color = pNum % 2 === 0 ? "Red" : "Green";
-                            currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
-                        }
-                    }
-                }
-            } catch (e) {
-                console.error("API Parse Error:", e.message);
             }
-        });
-    }).on('error', (err) => {
-        console.error("Network/API Error:", err.message);
-    });
+        }
+
+        historyRecords.sort((a, b) => b.issue.localeCompare(a.issue));
+        if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
+
+        runDeepDataAnalysis();
+
+        if (historyRecords.length > 0) {
+            let latestIssue = BigInt(historyRecords[0].issue);
+            let nextIssueStr = (latestIssue + 1n).toString();
+
+            if (nextIssueStr !== lastProcessedPeriod) {
+                lastProcessedPeriod = nextIssueStr;
+                currentRound.periodNumber = nextIssueStr;
+                currentRound.countdown = 30; // (bug fix: naya period = timer reset)
+
+                if (savedPredictions[nextIssueStr] === undefined) {
+                    let newPred = generateProbabilityPattern(nextIssueStr, historyRecords);
+                    currentRound.livePrediction = newPred;
+                    savedPredictions[nextIssueStr] = newPred.suggestedNum;
+                } else {
+                    let pNum = savedPredictions[nextIssueStr];
+                    let targetType = pNum >= 5 ? "Big" : "Small";
+                    let color = pNum % 2 === 0 ? "Red" : "Green";
+                    currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
+                }
+            }
+        }
+    } catch (e) {
+        console.error("API Parse Error:", e.message);
+    }
 }
 
 function startSyncLoop() {
