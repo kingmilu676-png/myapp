@@ -41,16 +41,12 @@ let analyticsStats = {
 };
 
 // ============================================================
-// === ROBUST API FETCH (BYPASS + ORIGIN + PROXIES + FALLBACK)
+// === ROBUST API FETCH (ORIGIN + PROXIES + FALLBACK) =========
 // ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
 
-// FREE KEY: scraperapi.com se le kar Render Environment me SCRAPERAPI_KEY daal do
-const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY || '';
-
-// Origin Cloudflare/WAF ke peeche hai -> datacenter IPs ko 403 deta hai.
-// Isliye browser-impersonating service + proxies + fallback.
+// Origin Cloudflare ke peeche hai -> datacenter IPs ko 403 deta hai.
 const PROXIES = [
     (u) => 'https://proxy.cors.dev/' + u,
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -70,7 +66,7 @@ const API_HEADERS = {
 
 function httpGetText(url, redirectsLeft = 5) {
     return new Promise((resolve, reject) => {
-        const req = https.get(url, { headers: API_HEADERS, timeout: 15000 }, (res) => {
+        const req = https.get(url, { headers: API_HEADERS, timeout: 12000 }, (res) => {
             const status = res.statusCode;
             if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
                 res.resume();
@@ -136,21 +132,10 @@ function extractList(json) {
 
 async function fetchRawApi() {
     const target = `${API_BASE}?ts=${Date.now()}`;
-    const attempts = [];
-
-    // 1) Sabse pehle browser-impersonating bypass (403 clear karta hai, agar key set ho)
-    if (SCRAPERAPI_KEY) {
-        attempts.push({
-            name: 'scraperapi',
-            url: 'https://api.scraperapi.com/?api_key=' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target)
-        });
-    }
-
-    // 2) Direct origin
-    attempts.push({ name: 'direct', url: target });
-
-    // 3) Normal public proxies
-    PROXIES.forEach((p, i) => attempts.push({ name: `proxy${i + 1}`, url: p(target) }));
+    const attempts = [
+        { name: 'direct', url: target },
+        ...PROXIES.map((p, i) => ({ name: `proxy${i + 1}`, url: p(target) }))
+    ];
 
     for (const att of attempts) {
         try {
@@ -175,21 +160,32 @@ async function fetchRawApi() {
     return null;
 }
 
-// Fallback: indialotteryapi.com (no auth) — sirf countdown drift sahi karta hai
+// Fallback: indialotteryapi.com (no auth) — REAL period + countdown deta hai
 async function fetchFallback() {
     try {
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
+        if (!nx || !nx.period) return false;
 
-        if (currentRound.periodNumber === "Loading...") {
-            if (historyRecords.length > 0) {
-                try { currentRound.periodNumber = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
-            }
-            if (currentRound.periodNumber === "Loading..." && nx && nx.period) {
-                currentRound.periodNumber = String(nx.period).replace('-', '');
+        // Real period (dash hata ke) — sahi bhi hai aur khud aage badhta bhi hai
+        const p = String(nx.period).replace('-', '');
+        if (p !== currentRound.periodNumber) {
+            currentRound.periodNumber = p;
+            if (savedPredictions[p] === undefined) {
+                const np = generateProbabilityPattern(p, historyRecords);
+                currentRound.livePrediction = np;
+                savedPredictions[p] = np.suggestedNum;
+            } else {
+                const q = savedPredictions[p];
+                currentRound.livePrediction = {
+                    suggestedNum: q,
+                    suggestedType: q >= 5 ? "Big" : "Small",
+                    suggestedColor: q % 2 === 0 ? "Red" : "Green"
+                };
             }
         }
 
-        if (nx && typeof nx.remain === 'number' && Math.abs(nx.remain - currentRound.countdown) >= 2) {
+        // Countdown drift sirf bade difference pe theek karo (jhatke na ho)
+        if (typeof nx.remain === 'number' && Math.abs(nx.remain - currentRound.countdown) >= 2) {
             currentRound.countdown = nx.remain;
         }
         return true;
@@ -626,21 +622,11 @@ function startSyncLoop() {
     setInterval(() => {
         fetchDamanApiData();
 
+        // Origin mode me hi local decrement (fallback me API khud set karta hai)
         if (currentRound.countdown > 0) {
             currentRound.countdown--;
         } else {
-            // Timer khatam = naya period. Fallback me period khud aage badhao (stop na ho)
             currentRound.countdown = 30;
-            if (usingFallback) {
-                try {
-                    currentRound.periodNumber = (BigInt(currentRound.periodNumber) + 1n).toString();
-                    if (savedPredictions[currentRound.periodNumber] === undefined) {
-                        const np = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
-                        currentRound.livePrediction = np;
-                        savedPredictions[currentRound.periodNumber] = np.suggestedNum;
-                    }
-                } catch (e) { /* ignore */ }
-            }
         }
 
         io.emit('timerUpdate', {
