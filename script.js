@@ -19,12 +19,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const HISTORY_LIMIT = 2000;
 const POLL_MS = 3000;
 const PERIOD_SECONDS = 30;
+const WATCHDOG_MS = 60000;
 
 let historyRecords = [];
 let savedPredictions = {};
 let lastProcessedPeriod = null;
 let usingFallback = false;
 let isFetching = false;
+let lastAdvanceAt = Date.now();
 
 let analyticsStats = {
     totalAnalyzed: 0,
@@ -157,7 +159,6 @@ async function fetchRawApi() {
     return null;
 }
 
-// STOP BYPASS: API dead ho to bhi countdown/period chalta rahe
 async function fetchFallback() {
     try {
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
@@ -194,6 +195,13 @@ function sortDesc() {
         try { return BigInt(b.issue) > BigInt(a.issue) ? 1 : (BigInt(b.issue) < BigInt(a.issue) ? -1 : 0); }
         catch (e) { return b.issue.localeCompare(a.issue); }
     });
+}
+
+function hashPeriod(p) {
+    const s = String(p);
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 100000;
+    return h;
 }
 
 // ============================================================
@@ -236,7 +244,7 @@ async function loadHistoryFromSupabase() {
                 savedPredictions[period] = item.pred_num;
             }
             const raw = item.results;
-            if (raw === null || raw === undefined || raw === '') continue; // pending row -> skip
+            if (raw === null || raw === undefined || raw === '') continue;
             const num = parseInt(raw);
             if (isNaN(num)) continue;
             historyRecords.push({
@@ -293,21 +301,17 @@ function runDeepDataAnalysis() {
 }
 
 // ============================================================
-// === PATTERN-BASED PREDICTION ENGINE (2000 records) ===
+// === PATTERN-BASED PREDICTION ENGINE ===
 // ============================================================
 function toChrono(history) { return history.slice().reverse(); }
 
-// Current Big/Small pattern ko 2000 history me dhoondh ke
-// uske baad historically kya aaya, uska weighted count.
 function patternNextOutcome(history) {
     const chrono = toChrono(history);
     if (chrono.length < 15) return { big: 0.5, small: 0.5, matches: 0, pattern: '' };
 
     const seq = chrono.map(h => (h.type === 'Big' ? 'B' : 'S'));
-
     let bigW = 0, smallW = 0, total = 0, bestPattern = '';
 
-    // k=6 (specific) se k=2 (broad) tak — lamba match = zyada weight
     for (let k = 6; k >= 2; k--) {
         if (seq.length <= k + 1) continue;
         const tail = seq.slice(-k).join('');
@@ -329,43 +333,50 @@ function patternNextOutcome(history) {
 
     let big = bigW / (bigW + smallW);
 
-    // 2000-record long-term balance (halka correction)
     const longW = history.slice(0, Math.min(500, history.length));
     let lb = 0, ls = 0;
     longW.forEach(h => h.type === 'Big' ? lb++ : ls++);
     const baseBig = (lb + ls) ? lb / (lb + ls) : 0.5;
     big = big * 0.8 + baseBig * 0.2;
 
-    // clamp: dono side ko hamesha real chance
     big = Math.max(0.2, Math.min(0.8, big));
-
     return { big, small: 1 - big, matches: total, pattern: bestPattern };
 }
 
-// Range ke andar number bhi pattern se: markov + frequency + overdue
 function pickNumberInRange(low, high, history, periodStr) {
     const chrono = toChrono(history);
     const nums = chrono.map(h => h.number).filter(n => typeof n === 'number' && !isNaN(n));
-    if (!nums.length) return low;
-    const last = nums[nums.length - 1];
+    const rangeSize = high - low + 1;
+    if (!nums.length) return low + (hashPeriod(periodStr) % rangeSize);
+
+    const win = nums.slice(-300);
+    const last = win[win.length - 1];
 
     const freq = {}, markov = {}, lastSeen = {};
     for (let n = low; n <= high; n++) { freq[n] = 0; markov[n] = 0; lastSeen[n] = -1; }
 
-    for (let i = 0; i < nums.length; i++) {
-        const n = nums[i];
+    for (let i = 0; i < win.length; i++) {
+        const n = win[i];
         if (n < low || n > high) continue;
         freq[n]++;
         lastSeen[n] = i;
-        if (i > 0 && nums[i - 1] === last) markov[n]++; // is number ke baad kya aaya
+        if (i > 0 && win[i - 1] === last) markov[n]++;
     }
 
-    const len = nums.length;
+    const maxFreq = Math.max(1, ...Object.values(freq));
+    const maxMarkov = Math.max(1, ...Object.values(markov));
+    const len = win.length;
+    const jitter = hashPeriod(periodStr);
+
     let best = low, bestScore = -Infinity;
     for (let n = low; n <= high; n++) {
         const overdue = lastSeen[n] === -1 ? len : (len - 1 - lastSeen[n]);
-        let score = markov[n] * 3 + freq[n] * 1.0 + overdue * 0.4;
-        if (n === last) score -= 0.6; // immediate repeat avoid
+        const fN = freq[n] / maxFreq;
+        const mN = markov[n] / maxMarkov;
+        const oN = overdue / len;
+        let score = mN * 0.45 + fN * 0.30 + oN * 0.25;
+        if (n === last) score -= 0.12;
+        score += ((jitter + n * 7) % 100) / 10000;
         if (score > bestScore) { bestScore = score; best = n; }
     }
     return best;
@@ -391,7 +402,18 @@ function generatePrediction(periodStr, history) {
 
 function setPredictionFor(period) {
     if (savedPredictions[period] === undefined) {
-        const np = generatePrediction(period, historyRecords);
+        let np = generatePrediction(period, historyRecords);
+
+        // lagatar same number avoid
+        const prevP = savedPredictions[lastProcessedPeriod];
+        if (prevP !== undefined && np.suggestedNum === prevP) {
+            const low = np.suggestedType === 'Big' ? 5 : 0;
+            const high = np.suggestedType === 'Big' ? 9 : 4;
+            let alt = np.suggestedNum + 1;
+            if (alt > high) alt = low;
+            np = { ...np, suggestedNum: alt, suggestedColor: colorFor(alt) };
+        }
+
         currentRound.livePrediction = np;
         savedPredictions[period] = np.suggestedNum;
         persistPrediction(period, np.suggestedNum);
@@ -408,6 +430,22 @@ function setPredictionFor(period) {
             sample: prev.sample ?? 0
         };
     }
+}
+
+function advancePeriod() {
+    let base = String(currentRound.periodNumber);
+    if (!/^\d+$/.test(base)) {
+        if (historyRecords.length) {
+            try { base = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) { return; }
+        } else {
+            return;
+        }
+    }
+    try {
+        currentRound.periodNumber = (BigInt(base) + 1n).toString();
+    } catch (e) { return; }
+    currentRound.countdown = PERIOD_SECONDS;
+    setPredictionFor(currentRound.periodNumber);
 }
 
 // ============================================================
@@ -587,11 +625,13 @@ async function fetchDamanApiData() {
         runDeepDataAnalysis();
 
         if (historyRecords.length > 0) {
-            const nextIssueStr = (BigInt(historyRecords[0].issue) + 1n).toString();
-            if (nextIssueStr !== lastProcessedPeriod) {
+            let nextIssueStr = null;
+            try { nextIssueStr = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
+            if (nextIssueStr && nextIssueStr !== lastProcessedPeriod) {
                 lastProcessedPeriod = nextIssueStr;
                 currentRound.periodNumber = nextIssueStr;
                 currentRound.countdown = PERIOD_SECONDS;
+                lastAdvanceAt = Date.now();
                 setPredictionFor(nextIssueStr);
             }
         }
@@ -602,18 +642,21 @@ async function fetchDamanApiData() {
     }
 }
 
-// countdown tick (1s) — STOP BYPASS ke saath
 function startCountdownLoop() {
     setInterval(() => {
         if (currentRound.countdown > 0) {
             currentRound.countdown--;
         } else {
-            currentRound.countdown = PERIOD_SECONDS;
-            try {
-                currentRound.periodNumber = (BigInt(currentRound.periodNumber) + 1n).toString();
-                setPredictionFor(currentRound.periodNumber);
-            } catch (e) {}
+            advancePeriod();
+            lastAdvanceAt = Date.now();
         }
+
+        // WATCHDOG: 60s tak period na badhe to force advance
+        if (Date.now() - lastAdvanceAt > WATCHDOG_MS) {
+            advancePeriod();
+            lastAdvanceAt = Date.now();
+        }
+
         io.emit('timerUpdate', {
             periodNumber: currentRound.periodNumber,
             countdown: currentRound.countdown,
