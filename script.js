@@ -39,7 +39,7 @@ let analyticsStats = {
     winRate: "0.0"
 };
 
-// === FETCH DATA VIA PROXY WORKER ===
+// === FETCH DATA VIA PROXY WORKER WITH HTML SAFE PARSING ===
 function fetchDamanApiData() {
     return new Promise((resolve, reject) => {
         const proxyUrl = process.env.PROXY_WORKER || 'https://wingo-proxy.kingmilu676.workers.dev';
@@ -47,8 +47,8 @@ function fetchDamanApiData() {
 
         https.get(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*'
             },
             timeout: 8000
         }, (res) => {
@@ -62,17 +62,20 @@ function fetchDamanApiData() {
                 try {
                     let cleanedData = rawData.trim();
 
-                    // HTML response handle karne ke liye
+                    // Check if response is HTML page instead of JSON
                     if (cleanedData.startsWith('<!DOCTYPE') || cleanedData.startsWith('<html')) {
-                        console.error("Received HTML response instead of JSON. Retrying...");
+                        console.error("Cloudflare sent HTML response. Waiting for next cycle...");
                         resolve(null);
                         return;
                     }
 
+                    // Fix JSON formatting if curly braces are offset
                     if (!cleanedData.startsWith('{') && cleanedData.includes('"data"')) {
                         const firstBrace = cleanedData.indexOf('{');
                         if (firstBrace !== -1) {
                             cleanedData = cleanedData.substring(firstBrace);
+                        } else {
+                            cleanedData = '{' + cleanedData + '}';
                         }
                     }
 
@@ -85,7 +88,7 @@ function fetchDamanApiData() {
                         resolve(null);
                     }
                 } catch (e) {
-                    console.error("JSON Parse Error Handled Cleanly:", e.message);
+                    console.error("Safely Handled JSON Parse Error:", e.message);
                     resolve(null);
                 }
             });
@@ -94,7 +97,6 @@ function fetchDamanApiData() {
             resolve(null);
         });
     });
-}
 }
 
 function runDeepDataAnalysis() {
@@ -214,7 +216,7 @@ async function updateLiveGameData() {
             runDeepDataAnalysis();
         }
     } catch (err) {
-        console.error("Live game sync error:", err.message);
+        console.error("Live sync error:", err.message);
     }
 }
 
