@@ -42,7 +42,7 @@ let currentRound = {
 };
 
 // ============================================================
-// === ROBUST API FETCH (BYPASS + PROXIES + FALLBACK)
+// === ROBUST API FETCH (BYPASS + PROXIES + FALLBACK) ===
 // ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
@@ -293,59 +293,87 @@ function runDeepDataAnalysis() {
 }
 
 // ============================================================
-// === NEW PREDICTION ENGINE ===
+// === PATTERN-BASED PREDICTION ENGINE (2000 records) ===
 // ============================================================
-function computeChances(history) {
-    if (!history.length) return { big: 0.5, small: 0.5, streak: 0, streakType: null };
+function toChrono(history) { return history.slice().reverse(); }
 
+// Current Big/Small pattern ko 2000 history me dhoondh ke
+// uske baad historically kya aaya, uska weighted count.
+function patternNextOutcome(history) {
+    const chrono = toChrono(history);
+    if (chrono.length < 15) return { big: 0.5, small: 0.5, matches: 0, pattern: '' };
+
+    const seq = chrono.map(h => (h.type === 'Big' ? 'B' : 'S'));
+
+    let bigW = 0, smallW = 0, total = 0, bestPattern = '';
+
+    // k=6 (specific) se k=2 (broad) tak — lamba match = zyada weight
+    for (let k = 6; k >= 2; k--) {
+        if (seq.length <= k + 1) continue;
+        const tail = seq.slice(-k).join('');
+        let b = 0, s = 0;
+        for (let i = 0; i + k < seq.length; i++) {
+            if (seq.slice(i, i + k).join('') === tail) {
+                if (seq[i + k] === 'B') b++; else s++;
+            }
+        }
+        if (b + s === 0) continue;
+        const w = k;
+        bigW += b * w;
+        smallW += s * w;
+        total += b + s;
+        if (!bestPattern) bestPattern = tail;
+    }
+
+    if (total === 0) return { big: 0.5, small: 0.5, matches: 0, pattern: '' };
+
+    let big = bigW / (bigW + smallW);
+
+    // 2000-record long-term balance (halka correction)
     const longW = history.slice(0, Math.min(500, history.length));
-    let b = 0, s = 0;
-    longW.forEach(h => h.type === 'Big' ? b++ : s++);
-    const baseBig = (b + s) ? b / (b + s) : 0.5;
+    let lb = 0, ls = 0;
+    longW.forEach(h => h.type === 'Big' ? lb++ : ls++);
+    const baseBig = (lb + ls) ? lb / (lb + ls) : 0.5;
+    big = big * 0.8 + baseBig * 0.2;
 
-    const recentW = history.slice(0, Math.min(30, history.length));
-    let rb = 0, rs = 0;
-    recentW.forEach(h => h.type === 'Big' ? rb++ : rs++);
-    const recentBig = (rb + rs) ? rb / (rb + rs) : 0.5;
+    // clamp: dono side ko hamesha real chance
+    big = Math.max(0.2, Math.min(0.8, big));
 
-    let streakType = history[0].type, streak = 0;
-    for (const h of history) { if (h.type === streakType) streak++; else break; }
-
-    let score = (baseBig - 0.5) * 0.8 + (recentBig - 0.5) * 1.2;
-    if (streak >= 4) score += (streakType === 'Big' ? -0.30 : 0.30);
-    else if (streak >= 2) score += (streakType === 'Big' ? -0.10 : 0.10);
-
-    let bigChance = 0.5 + Math.max(-0.35, Math.min(0.35, score));
-    bigChance = Math.max(0.15, Math.min(0.85, bigChance));
-    return { big: bigChance, small: 1 - bigChance, streak, streakType };
+    return { big, small: 1 - big, matches: total, pattern: bestPattern };
 }
 
+// Range ke andar number bhi pattern se: markov + frequency + overdue
 function pickNumberInRange(low, high, history, periodStr) {
-    const freq = {};
-    for (let n = low; n <= high; n++) freq[n] = 0;
-    history.slice(0, 300).forEach(h => {
-        if (h.number >= low && h.number <= high) freq[h.number]++;
-    });
+    const chrono = toChrono(history);
+    const nums = chrono.map(h => h.number).filter(n => typeof n === 'number' && !isNaN(n));
+    if (!nums.length) return low;
+    const last = nums[nums.length - 1];
 
-    const sorted = Object.keys(freq).map(Number).sort((a, b) => freq[b] - freq[a]);
-    const last = history[0] && history[0].number;
+    const freq = {}, markov = {}, lastSeen = {};
+    for (let n = low; n <= high; n++) { freq[n] = 0; markov[n] = 0; lastSeen[n] = -1; }
 
-    let seed = 0;
-    try { seed = Number(BigInt(periodStr) % 100n); } catch (e) { seed = parseInt(periodStr.slice(-2)) || 0; }
-
-    let pick = sorted.find(n => n !== last);
-    if (pick === undefined) pick = sorted[0];
-
-    if (seed % 3 === 0) {
-        pick = sorted[seed % sorted.length];
-        if (pick === last) pick = sorted[(seed + 1) % sorted.length];
+    for (let i = 0; i < nums.length; i++) {
+        const n = nums[i];
+        if (n < low || n > high) continue;
+        freq[n]++;
+        lastSeen[n] = i;
+        if (i > 0 && nums[i - 1] === last) markov[n]++; // is number ke baad kya aaya
     }
-    return pick;
+
+    const len = nums.length;
+    let best = low, bestScore = -Infinity;
+    for (let n = low; n <= high; n++) {
+        const overdue = lastSeen[n] === -1 ? len : (len - 1 - lastSeen[n]);
+        let score = markov[n] * 3 + freq[n] * 1.0 + overdue * 0.4;
+        if (n === last) score -= 0.6; // immediate repeat avoid
+        if (score > bestScore) { bestScore = score; best = n; }
+    }
+    return best;
 }
 
 function generatePrediction(periodStr, history) {
-    const ch = computeChances(history);
-    const goBig = ch.big >= ch.small;
+    const p = patternNextOutcome(history);
+    const goBig = p.big >= p.small;
     const low = goBig ? 5 : 0;
     const high = goBig ? 9 : 4;
     const num = pickNumberInRange(low, high, history, periodStr);
@@ -354,8 +382,10 @@ function generatePrediction(periodStr, history) {
         suggestedNum: num,
         suggestedType: goBig ? 'Big' : 'Small',
         suggestedColor: colorFor(num),
-        bigChance: (ch.big * 100).toFixed(1),
-        smallChance: (ch.small * 100).toFixed(1)
+        bigChance: (p.big * 100).toFixed(1),
+        smallChance: (p.small * 100).toFixed(1),
+        pattern: p.pattern,
+        sample: p.matches
     };
 }
 
@@ -367,12 +397,15 @@ function setPredictionFor(period) {
         persistPrediction(period, np.suggestedNum);
     } else {
         const p = savedPredictions[period];
+        const prev = currentRound.livePrediction || {};
         currentRound.livePrediction = {
             suggestedNum: p,
             suggestedType: typeFor(p),
             suggestedColor: colorFor(p),
-            bigChance: currentRound.livePrediction ? currentRound.livePrediction.bigChance : '-',
-            smallChance: currentRound.livePrediction ? currentRound.livePrediction.smallChance : '-'
+            bigChance: prev.bigChance ?? '-',
+            smallChance: prev.smallChance ?? '-',
+            pattern: prev.pattern ?? '',
+            sample: prev.sample ?? 0
         };
     }
 }
@@ -440,6 +473,9 @@ h2 { color:#00e676; margin-bottom:15px; font-size:22px; }
             Big <b id="bigPct" style="color:#4caf50;">0%</b> / Small <b id="smallPct" style="color:#ff5252;">0%</b>
         </div>
         <div class="chance-bar"><div class="chance-big" id="bigBar" style="width:50%"></div><div class="chance-small" id="smallBar" style="width:50%"></div></div>
+        <div style="font-size:11px;color:#888;margin-top:6px;">
+            Pattern: <b id="predPattern" style="color:#90caf9;">-</b> | Sample: <b id="predSample">0</b> hits
+        </div>
     </div>
 
     <div class="history-container">
@@ -477,6 +513,8 @@ socket.on('timerUpdate', (data) => {
         document.getElementById('smallPct').innerText = data.prediction.smallChance + '%';
         document.getElementById('bigBar').style.width = bp + '%';
         document.getElementById('smallBar').style.width = (100 - bp) + '%';
+        document.getElementById('predPattern').innerText = data.prediction.pattern || '-';
+        document.getElementById('predSample').innerText = data.prediction.sample || 0;
     }
     if (data.history) {
         let html = '';
@@ -594,7 +632,7 @@ loadHistoryFromSupabase()
     .catch(e => console.error('Load failed:', e))
     .finally(() => {
         server.listen(PORT, () => {
-            console.log(`Facing AI Server on http://localhost:${PORT} | real history + prediction engine ON`);
+            console.log(`Facing AI Server on http://localhost:${PORT} | pattern prediction ON`);
             fetchDamanApiData();
             startCountdownLoop();
             startPollLoop();
