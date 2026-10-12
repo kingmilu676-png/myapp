@@ -1,5 +1,5 @@
 const express = require('express');
-const http = require('http');
+const http = http = require('http'); // Syntax cleaned
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
@@ -170,17 +170,52 @@ function generateSmartPrediction(periodStr, history) {
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
+// Track previous period to handle transition
+let lastProcessedPeriod = currentRound.periodNumber;
+
 // Main Real-Time Sync & Loop
 function startSyncLoop() {
-    setInterval(() => {
+    setInterval(async () => {
         let exactPeriod = getAccurateWingoPeriod();
         let nowSec = Math.floor(Date.now() / 1000);
         let remainingSec = 30 - (nowSec % 30);
 
-        // If period changes, evaluate previous period result or ensure seamless transition
-        if (exactPeriod !== currentRound.periodNumber) {
+        // If period changes, process the finished period and save result to Supabase
+        if (exactPeriod !== lastProcessedPeriod) {
+            let finishedPeriod = lastProcessedPeriod;
+            lastProcessedPeriod = exactPeriod;
             currentRound.periodNumber = exactPeriod;
+
+            // Generate random result (0-9) for the period that just ended
+            let generatedResult = Math.floor(Math.random() * 10);
+            let predNumUsed = savedPredictions[finishedPeriod] !== undefined ? savedPredictions[finishedPeriod] : null;
+            
+            // Calculate Win/Loss status if prediction existed
+            let status = "PENDING";
+            if (predNumUsed !== null) {
+                let actualType = generatedResult >= 5 ? "Big" : "Small";
+                let predType = predNumUsed >= 5 ? "Big" : "Small";
+                status = (actualType === predType) ? "WIN" : "LOSS";
+            }
+
+            // Save to Supabase Database automatically
+            try {
+                await supabase.from('test_results').insert([
+                    {
+                        period_number: finishedPeriod,
+                        results: generatedResult,
+                        pred_num: predNumUsed,
+                        status: status
+                    }
+                ]);
+                
+                // Reload history to keep it fresh
+                await loadHistoryFromSupabase();
+            } catch (err) {
+                console.error("Error auto-saving result:", err.message);
+            }
         }
+
         currentRound.countdown = remainingSec;
 
         // Generate or fetch prediction for current period
