@@ -21,8 +21,22 @@ const SUPABASE_URL = 'https://knafkiozaguyvemtrjfz.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+const HISTORY_LIMIT = 2000;
+
 let historyRecords = [];
 let savedPredictions = {};
+let lastProcessedPeriod = null;
+
+// Fallback Period Generator
+function getCurrentFallbackPeriod() {
+    const now = new Date();
+    const YYYY = now.getFullYear();
+    const MM = String(now.getMonth() + 1).padStart(2, '0');
+    const DD = String(now.getDate()).padStart(2, '0');
+    const totalSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    const periodSeq = String(Math.floor(totalSeconds / 30) + 1).padStart(4, '0');
+    return `${YYYY}${MM}${DD}1000${periodSeq}`;
+}
 
 app.use(express.static(__dirname));
 
@@ -39,64 +53,34 @@ let analyticsStats = {
     winRate: "0.0"
 };
 
-// === FETCH DATA VIA PROXY WORKER WITH HTML SAFE PARSING ===
-function fetchDamanApiData() {
-    return new Promise((resolve, reject) => {
-        const proxyUrl = process.env.PROXY_WORKER || 'https://wingo-proxy.kingmilu676.workers.dev';
-        const url = `${proxyUrl}?ts=${Date.now()}`;
+async function loadHistoryFromSupabase() {
+    try {
+        const { data, error } = await supabase
+            .from('test_results')
+            .select('*')
+            .order('period_number', { ascending: false })
+            .limit(HISTORY_LIMIT);
 
-        https.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*'
-            },
-            timeout: 8000
-        }, (res) => {
-            let rawData = '';
+        if (error) {
+            console.error("Supabase Load Error:", error.message);
+            return;
+        }
 
-            res.on('data', (chunk) => {
-                rawData += chunk;
-            });
-
-            res.on('end', () => {
-                try {
-                    let cleanedData = rawData.trim();
-
-                    // Check if response is HTML page instead of JSON
-                    if (cleanedData.startsWith('<!DOCTYPE') || cleanedData.startsWith('<html')) {
-                        console.error("Cloudflare sent HTML response. Waiting for next cycle...");
-                        resolve(null);
-                        return;
-                    }
-
-                    // Fix JSON formatting if curly braces are offset
-                    if (!cleanedData.startsWith('{') && cleanedData.includes('"data"')) {
-                        const firstBrace = cleanedData.indexOf('{');
-                        if (firstBrace !== -1) {
-                            cleanedData = cleanedData.substring(firstBrace);
-                        } else {
-                            cleanedData = '{' + cleanedData + '}';
-                        }
-                    }
-
-                    const parsedData = JSON.parse(cleanedData);
-                    if (parsedData && parsedData.data && parsedData.data.list) {
-                        resolve(parsedData.data.list);
-                    } else if (Array.isArray(parsedData)) {
-                        resolve(parsedData);
-                    } else {
-                        resolve(null);
-                    }
-                } catch (e) {
-                    console.error("Safely Handled JSON Parse Error:", e.message);
-                    resolve(null);
-                }
-            });
-        }).on('error', (err) => {
-            console.error("Proxy Connection Error:", err.message);
-            resolve(null);
-        });
-    });
+        if (data && data.length > 0) {
+            historyRecords = data.map(item => ({
+                issue: String(item.period_number),
+                number: parseInt(item.results ?? 0),
+                type: parseInt(item.results ?? 0) >= 5 ? "Big" : "Small",
+                color: parseInt(item.results ?? 0) % 2 === 0 ? "Red" : "Green",
+                predNum: item.pred_num ?? null,
+                status: item.status || "PENDING"
+            }));
+            console.log(`Loaded ${historyRecords.length} records from Supabase.`);
+            runDeepDataAnalysis();
+        }
+    } catch (e) {
+        console.log("Load exception:", e);
+    }
 }
 
 function runDeepDataAnalysis() {
@@ -151,17 +135,13 @@ function runDeepDataAnalysis() {
     };
 }
 
-function getNextPeriodNumber(lastIssue) {
-    if (!lastIssue) return "Loading...";
-    try {
-        let bigNum = BigInt(lastIssue);
-        return (bigNum + 1n).toString();
-    } catch (e) {
-        return lastIssue;
-    }
-}
+let currentRound = {
+    periodNumber: getCurrentFallbackPeriod(),
+    countdown: 30,
+    livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
+};
 
-function generateSmartPrediction(periodStr, history) {
+function generateProbabilityPattern(periodStr, history) {
     if (!history || history.length < 3) return { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" };
 
     let last1 = history[0].number;
@@ -176,75 +156,143 @@ function generateSmartPrediction(periodStr, history) {
     let calculatedNum = (last1 * 3 + last2 * 2 + last3 + (p1 * 7) + p2 + hotBonus) % 10;
     if (calculatedNum < 0) calculatedNum += 10;
 
+    if (calculatedNum === last1) {
+        calculatedNum = (last1 + 3) % 10;
+    }
+
     let type = calculatedNum >= 5 ? "Big" : "Small";
     let color = calculatedNum % 2 === 0 ? "Red" : "Green";
 
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
-let activePeriodNumber = "Loading...";
+// === OFFICIAL DAMAN API INTEGRATION ===
+async function fetchDamanApiData() {
+    const timestamp = Date.now();
+    const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
 
-async function updateLiveGameData() {
-    try {
-        const apiList = await fetchDamanApiData();
-        if (apiList && apiList.length > 0) {
-            let latestIssue = apiList[0].issueNumber || apiList[0].periodNumber || apiList[0].issue;
-            activePeriodNumber = getNextPeriodNumber(latestIssue);
-
-            historyRecords = apiList.map(item => {
-                const issueStr = String(item.issueNumber || item.periodNumber || item.issue || '');
-                const num = parseInt(item.number ?? item.result ?? 0);
-                const pred = savedPredictions[issueStr] !== undefined ? savedPredictions[issueStr] : null;
-
-                let status = "PENDING";
-                if (pred !== null) {
-                    let actualType = num >= 5 ? "Big" : "Small";
-                    let predType = pred >= 5 ? "Big" : "Small";
-                    status = (actualType === predType) ? "WIN" : "LOSS";
+    const req = https.get(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache'
+        },
+        timeout: 4000
+    }, (res) => {
+        let rawData = '';
+        res.on('data', (chunk) => { rawData += chunk; });
+        res.on('end', async () => {
+            try {
+                if (rawData.trim().startsWith('<')) {
+                    return;
                 }
 
-                return {
-                    issue: issueStr,
-                    number: num,
-                    type: num >= 5 ? "Big" : "Small",
-                    color: num % 2 === 0 ? "Red" : "Green",
-                    predNum: pred,
-                    status: status
-                };
-            });
+                const json = JSON.parse(rawData);
+                const dataObj = json.data || json;
+                let listArray = dataObj.list || dataObj.data?.list || json.list || [];
 
-            runDeepDataAnalysis();
-        }
-    } catch (err) {
-        console.error("Live sync error:", err.message);
-    }
+                if (Array.isArray(listArray) && listArray.length > 0) {
+                    for (let item of listArray) {
+                        const iss = String(item.issueNumber || item.issue || '');
+                        const num = parseInt(item.number ?? item.winningNumber ?? item.price ?? item.sum);
+
+                        if (iss && !isNaN(num)) {
+                            const type = num >= 5 ? "Big" : "Small";
+                            const color = num % 2 === 0 ? "Red" : "Green";
+
+                            let existing = historyRecords.find(h => h.issue === iss);
+                            let pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
+                            let status = pNum !== null ? (pNum === num ? "WIN" : "LOSS") : "PENDING";
+
+                            if (!existing) {
+                                historyRecords.push({
+                                    issue: iss,
+                                    number: num,
+                                    type: type,
+                                    color: color,
+                                    predNum: pNum,
+                                    status: status
+                                });
+
+                                await supabase.from('test_results').upsert({
+                                    period_number: iss,
+                                    results: String(num),
+                                    pred_num: pNum,
+                                    status: status
+                                }, { onConflict: ['period_number'] });
+
+                            } else {
+                                existing.number = num;
+                                existing.type = type;
+                                existing.color = color;
+                                if (pNum !== null) {
+                                    existing.predNum = pNum;
+                                    existing.status = (pNum === num) ? "WIN" : "LOSS";
+                                }
+
+                                await supabase.from('test_results').upsert({
+                                    period_number: iss,
+                                    results: String(num),
+                                    pred_num: existing.predNum,
+                                    status: existing.status
+                                }, { onConflict: ['period_number'] });
+                            }
+                        }
+                    }
+                }
+
+                historyRecords.sort((a, b) => b.issue.localeCompare(a.issue));
+                if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
+
+                runDeepDataAnalysis();
+
+                if (historyRecords.length > 0) {
+                    let latestIssue = BigInt(historyRecords[0].issue);
+                    let nextIssueStr = (latestIssue + 1n).toString();
+                    currentRound.periodNumber = nextIssueStr;
+                }
+            } catch (e) {
+                // Ignore parsing errors gracefully
+            }
+        });
+    });
+
+    req.on('error', (err) => {});
+    req.on('timeout', () => { req.destroy(); });
 }
 
 function startSyncLoop() {
-    setInterval(async () => {
-        let nowSec = Math.floor(Date.now() / 1000);
-        let remainingSec = 30 - (nowSec % 30);
+    setInterval(() => {
+        fetchDamanApiData();
 
-        if (remainingSec === 30 || remainingSec === 1 || historyRecords.length === 0) {
-            await updateLiveGameData();
+        if (currentRound.countdown > 0) {
+            currentRound.countdown--;
+        } else {
+            currentRound.countdown = 30;
+            if (historyRecords.length > 0) {
+                let latestIssue = BigInt(historyRecords[0].issue);
+                currentRound.periodNumber = (latestIssue + 1n).toString();
+            } else {
+                currentRound.periodNumber = getCurrentFallbackPeriod();
+            }
         }
 
-        if (activePeriodNumber !== "Loading..." && !savedPredictions[activePeriodNumber]) {
-            let pred = generateSmartPrediction(activePeriodNumber, historyRecords);
-            savedPredictions[activePeriodNumber] = pred.suggestedNum;
+        if (savedPredictions[currentRound.periodNumber] === undefined) {
+            let newPred = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
+            currentRound.livePrediction = newPred;
+            savedPredictions[currentRound.periodNumber] = newPred.suggestedNum;
+        } else {
+            let pNum = savedPredictions[currentRound.periodNumber];
+            let targetType = pNum >= 5 ? "Big" : "Small";
+            let color = pNum % 2 === 0 ? "Red" : "Green";
+            currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
         }
-
-        let currentPredNum = savedPredictions[activePeriodNumber] !== undefined ? savedPredictions[activePeriodNumber] : 7;
-        let currentPrediction = {
-            suggestedNum: currentPredNum,
-            suggestedType: currentPredNum >= 5 ? "Big" : "Small",
-            suggestedColor: currentPredNum % 2 === 0 ? "Red" : "Green"
-        };
 
         io.emit('timerUpdate', {
-            periodNumber: activePeriodNumber,
-            countdown: remainingSec,
-            prediction: currentPrediction,
+            periodNumber: currentRound.periodNumber,
+            countdown: currentRound.countdown,
+            prediction: currentRound.livePrediction,
             analytics: analyticsStats,
             history: historyRecords
         });
@@ -252,22 +300,18 @@ function startSyncLoop() {
 }
 
 io.on('connection', (socket) => {
-    let currentPredNum = savedPredictions[activePeriodNumber] !== undefined ? savedPredictions[activePeriodNumber] : 7;
     socket.emit('timerUpdate', {
-        periodNumber: activePeriodNumber,
-        countdown: 30 - (Math.floor(Date.now() / 1000) % 30),
-        prediction: {
-            suggestedNum: currentPredNum,
-            suggestedType: currentPredNum >= 5 ? "Big" : "Small",
-            suggestedColor: currentPredNum % 2 === 0 ? "Red" : "Green"
-        },
+        periodNumber: currentRound.periodNumber,
+        countdown: currentRound.countdown,
+        prediction: currentRound.livePrediction,
         analytics: analyticsStats,
         history: historyRecords
     });
 });
 
-server.listen(PORT, async () => {
-    console.log(`Server running on port ${PORT}`);
-    await updateLiveGameData();
-    startSyncLoop();
+loadHistoryFromSupabase().then(() => {
+    server.listen(PORT, () => {
+        console.log(`Facing AI Server running at http://localhost:${PORT}`);
+        startSyncLoop();
+    });
 });
