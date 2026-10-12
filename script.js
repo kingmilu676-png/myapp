@@ -50,7 +50,7 @@ function fetchDamanApiData() {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'application/json'
             },
-            timeout: 10000
+            timeout: 8000
         }, (res) => {
             let rawData = '';
 
@@ -61,11 +61,21 @@ function fetchDamanApiData() {
             res.on('end', () => {
                 try {
                     let cleanedData = rawData.trim();
-                    // Fix malformed JSON if missing leading curly brace
-                    if (cleanedData.startsWith('"data"') || cleanedData.startsWith('data:')) {
-                        cleanedData = '{' + cleanedData + '}';
+
+                    // HTML response handle karne ke liye
+                    if (cleanedData.startsWith('<!DOCTYPE') || cleanedData.startsWith('<html')) {
+                        console.error("Received HTML response instead of JSON. Retrying...");
+                        resolve(null);
+                        return;
                     }
-                    
+
+                    if (!cleanedData.startsWith('{') && cleanedData.includes('"data"')) {
+                        const firstBrace = cleanedData.indexOf('{');
+                        if (firstBrace !== -1) {
+                            cleanedData = cleanedData.substring(firstBrace);
+                        }
+                    }
+
                     const parsedData = JSON.parse(cleanedData);
                     if (parsedData && parsedData.data && parsedData.data.list) {
                         resolve(parsedData.data.list);
@@ -75,7 +85,7 @@ function fetchDamanApiData() {
                         resolve(null);
                     }
                 } catch (e) {
-                    console.error("JSON Parse Error:", e.message);
+                    console.error("JSON Parse Error Handled Cleanly:", e.message);
                     resolve(null);
                 }
             });
@@ -84,6 +94,7 @@ function fetchDamanApiData() {
             resolve(null);
         });
     });
+}
 }
 
 function runDeepDataAnalysis() {
