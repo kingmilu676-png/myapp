@@ -167,17 +167,14 @@
         const socket = io();
 
         socket.on('timerUpdate', (data) => {
-            // Period Number Update
-            if (data.periodNumber && data.periodNumber !== "Loading...") {
+            if (data.periodNumber) {
                 document.getElementById('periodNumber').innerText = data.periodNumber;
             }
 
-            // Countdown Timer Update
             if (data.countdown !== undefined) {
                 document.getElementById('timer').innerText = data.countdown;
             }
 
-            // Live Prediction Update
             if (data.prediction) {
                 document.getElementById('predNum').innerText = data.prediction.suggestedNum;
                 document.getElementById('predType').innerText = data.prediction.suggestedType;
@@ -185,7 +182,6 @@
                 document.getElementById('predColor').style.color = data.prediction.suggestedColor === 'Red' ? '#ff5252' : '#4caf50';
             }
 
-            // History Update
             if (data.history && data.history.length > 0) {
                 let html = '';
                 data.history.forEach(item => {
