@@ -21,7 +21,6 @@ const SUPABASE_URL = 'https://knafkiozaguyvemtrjfz.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// === 2000 RECORDS LIMIT SETTING ===
 const HISTORY_LIMIT = 2000;
 
 let historyRecords = [];
@@ -30,7 +29,6 @@ let lastProcessedPeriod = null;
 let usingFallback = false;
 let isFetching = false;
 
-// Analytics Stats Object
 let analyticsStats = {
     totalAnalyzed: 0,
     bigPercent: 50,
@@ -40,17 +38,10 @@ let analyticsStats = {
     winRate: 0
 };
 
-// ============================================================
-// === ROBUST API FETCH (BYPASS + ORIGIN + PROXIES + FALLBACK)
-// ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
-
-// FREE KEY: scraperapi.com se le kar Render Environment me SCRAPERAPI_KEY daal do
 const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY || '';
 
-// Origin Cloudflare/WAF ke peeche hai -> datacenter IPs ko 403 deta hai.
-// Isliye browser-impersonating service + proxies + fallback.
 const PROXIES = [
     (u) => 'https://proxy.cors.dev/' + u,
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -138,48 +129,32 @@ async function fetchRawApi() {
     const target = `${API_BASE}?ts=${Date.now()}`;
     const attempts = [];
 
-    // 1) Sabse pehle browser-impersonating bypass (403 clear karta hai, agar key set ho)
     if (SCRAPERAPI_KEY) {
         attempts.push({
             name: 'scraperapi',
-            url: 'https://api.scraperapi.com/?api_key=' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target)
+            url: '[https://api.scraperapi.com/?api_key=](https://api.scraperapi.com/?api_key=)' + SCRAPERAPI_KEY + '&url=' + encodeURIComponent(target)
         });
     }
 
-    // 2) Direct origin
     attempts.push({ name: 'direct', url: target });
-
-    // 3) Normal public proxies
     PROXIES.forEach((p, i) => attempts.push({ name: `proxy${i + 1}`, url: p(target) }));
 
     for (const att of attempts) {
         try {
             const res = await httpGetText(att.url);
             const isHtml = /text\/html/i.test(res.contentType) || res.raw.trim().startsWith('<');
-            if (res.status >= 400 || isHtml) {
-                console.log(`[API] ${att.name} failed (status=${res.status}, html=${isHtml})`);
-                continue;
-            }
+            if (res.status >= 400 || isHtml) continue;
             const json = tryParseJson(res.raw);
-            if (!json) { console.log(`[API] ${att.name} not JSON: ${res.raw.slice(0, 80)}`); continue; }
-            if (json.error && !(json.data && json.data.list)) {
-                console.log(`[API] ${att.name} error json: ${JSON.stringify(json).slice(0, 80)}`);
-                continue;
-            }
-            console.log(`[API] ${att.name} OK`);
+            if (!json) continue;
             return json;
-        } catch (e) {
-            console.log(`[API] ${att.name} error: ${e.message}`);
-        }
+        } catch (e) {}
     }
     return null;
 }
 
-// Fallback: indialotteryapi.com (no auth) — sirf countdown drift sahi karta hai
 async function fetchFallback() {
     try {
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
-
         if (currentRound.periodNumber === "Loading...") {
             if (historyRecords.length > 0) {
                 try { currentRound.periodNumber = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
@@ -188,19 +163,15 @@ async function fetchFallback() {
                 currentRound.periodNumber = String(nx.period).replace('-', '');
             }
         }
-
         if (nx && typeof nx.remain === 'number' && Math.abs(nx.remain - currentRound.countdown) >= 2) {
             currentRound.countdown = nx.remain;
         }
         return true;
     } catch (e) {
-        console.log('[API] fallback error:', e.message);
         return false;
     }
 }
-// ============================================================
 
-// Supabase se 2000 data load karein aur Analyze karein
 async function loadHistoryFromSupabase() {
     try {
         const { data, error } = await supabase
@@ -209,10 +180,7 @@ async function loadHistoryFromSupabase() {
             .order('period_number', { ascending: false })
             .limit(HISTORY_LIMIT);
 
-        if (error) {
-            console.error("Supabase Load Error:", error.message);
-            return;
-        }
+        if (error) return;
 
         if (data && data.length > 0) {
             historyRecords = data.map(item => ({
@@ -223,15 +191,11 @@ async function loadHistoryFromSupabase() {
                 predNum: item.pred_num ?? null,
                 status: item.status || "PENDING"
             }));
-            console.log(`Loaded ${historyRecords.length} records from Supabase.`);
             runDeepDataAnalysis();
         }
-    } catch (e) {
-        console.log("Load exception:", e);
-    }
+    } catch (e) {}
 }
 
-// === 2000 RECORDS ANALYSIS ENGINE ===
 function runDeepDataAnalysis() {
     if (!historyRecords || historyRecords.length === 0) return;
 
@@ -284,7 +248,6 @@ function runDeepDataAnalysis() {
     };
 }
 
-// Frontend HTML Interface
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -294,105 +257,22 @@ app.get('/', (req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Facing AI Pattern Matcher Tool - Milu</title>
         <style>
-            body {
-                font-family: Arial, sans-serif;
-                background-color: #121212;
-                color: #ffffff;
-                text-align: center;
-                padding: 15px;
-                margin: 0;
-            }
-            .container {
-                max-width: 460px;
-                margin: 15px auto;
-                background: #1e1e1e;
-                padding: 20px;
-                border-radius: 12px;
-                box-shadow: 0 6px 15px rgba(0,0,0,0.6);
-            }
+            body { font-family: Arial, sans-serif; background-color: #121212; color: #ffffff; text-align: center; padding: 15px; margin: 0; }
+            .container { max-width: 460px; margin: 15px auto; background: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0,0,0,0.6); }
             h2 { color: #00e676; margin-bottom: 15px; font-size: 22px; }
-            .timer-box {
-                font-size: 24px;
-                font-weight: bold;
-                color: #ff9800;
-                margin: 10px 0;
-                background: #2a2a2a;
-                padding: 8px;
-                border-radius: 8px;
-            }
-            .period-box {
-                font-size: 16px;
-                color: #b0bec5;
-                margin-bottom: 10px;
-            }
-            .analytics-card {
-                background: #1a232a;
-                border: 1px solid #00b0ff;
-                border-radius: 8px;
-                padding: 10px;
-                margin: 12px 0;
-                font-size: 13px;
-                text-align: left;
-            }
-            .analytics-card h4 {
-                margin: 0 0 8px 0;
-                color: #00b0ff;
-                text-align: center;
-            }
-            .stats-grid {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 8px;
-            }
-            .stat-item {
-                background: #252d35;
-                padding: 6px 8px;
-                border-radius: 4px;
-            }
-            .prediction-card {
-                background: #252525;
-                border: 2px solid #00e676;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 15px 0;
-            }
+            .timer-box { font-size: 24px; font-weight: bold; color: #ff9800; margin: 10px 0; background: #2a2a2a; padding: 8px; border-radius: 8px; }
+            .period-box { font-size: 16px; color: #b0bec5; margin-bottom: 10px; }
+            .analytics-card { background: #1a232a; border: 1px solid #00b0ff; border-radius: 8px; padding: 10px; margin: 12px 0; font-size: 13px; text-align: left; }
+            .analytics-card h4 { margin: 0 0 8px 0; color: #00b0ff; text-align: center; }
+            .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+            .stat-item { background: #252d35; padding: 6px 8px; border-radius: 4px; }
+            .prediction-card { background: #252525; border: 2px solid #00e676; padding: 15px; border-radius: 8px; margin: 15px 0; }
             .prediction-card h3 { margin: 0 0 8px 0; color: #00e676; font-size: 16px; }
-            .pred-num-box {
-                font-size: 40px;
-                font-weight: bold;
-                color: #00e676;
-                margin: 5px 0;
-            }
-            .pred-details {
-                font-size: 15px;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            .history-container {
-                margin-top: 20px;
-                text-align: left;
-                background: #252525;
-                padding: 12px;
-                border-radius: 8px;
-                max-height: 250px;
-                overflow-y: auto;
-                border: 1px solid #333;
-            }
-            .history-container h3 {
-                margin-top: 0;
-                font-size: 15px;
-                color: #90caf9;
-                border-bottom: 1px solid #444;
-                padding-bottom: 6px;
-            }
-            .history-item {
-                padding: 8px 6px;
-                border-bottom: 1px solid #333;
-                font-size: 12px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }
+            .pred-num-box { font-size: 40px; font-weight: bold; color: #00e676; margin: 5px 0; }
+            .pred-details { font-size: 15px; color: #ffffff; font-weight: bold; }
+            .history-container { margin-top: 20px; text-align: left; background: #252525; padding: 12px; border-radius: 8px; max-height: 250px; overflow-y: auto; border: 1px solid #333; }
+            .history-container h3 { margin-top: 0; font-size: 15px; color: #90caf9; border-bottom: 1px solid #444; padding-bottom: 6px; }
+            .history-item { padding: 8px 6px; border-bottom: 1px solid #333; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
             .badge-big { background: #4caf50; color: white; padding: 2px 5px; border-radius: 3px; }
             .badge-small { background: #ff5252; color: white; padding: 2px 5px; border-radius: 3px; }
             .status-win { background: #2e7d32; color: #fff; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
@@ -400,13 +280,10 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-
         <div class="container">
             <h2>Facing AI Pattern Tool - Milu</h2>
             <div class="period-box">Target Period: <span id="periodNumber" style="color: #fff; font-weight: bold;">Loading...</span></div>
             <div class="timer-box">Time Left: <span id="timer">30</span>s</div>
-
-            <!-- 2000 Records Data Analytics Card -->
             <div class="analytics-card">
                 <h4>2000 Records Deep Analysis</h4>
                 <div class="stats-grid">
@@ -416,8 +293,6 @@ app.get('/', (req, res) => {
                     <div class="stat-item">Hot/Due: <b id="statHotDue" style="color:#29b6f6;">- / -</b></div>
                 </div>
             </div>
-
-            <!-- Prediction Display Card (Shows the exact suggested number & details) -->
             <div class="prediction-card">
                 <h3>Next Expected Number Prediction</h3>
                 <div class="pred-num-box" id="predNum">-</div>
@@ -425,17 +300,14 @@ app.get('/', (req, res) => {
                     Type: <span id="predType" style="color:#00b0ff;">-</span> | Color: <span id="predColor">-</span>
                 </div>
             </div>
-
             <div class="history-container">
                 <h3>Live History & Win/Loss Status</h3>
                 <div id="historyList">Loading history...</div>
             </div>
         </div>
-
         <script src="/socket.io/socket.io.js"></script>
         <script>
             const socket = io();
-
             socket.on('timerUpdate', (data) => {
                 if (data.periodNumber && data.periodNumber !== "Loading...") {
                     document.getElementById('periodNumber').innerText = data.periodNumber;
@@ -443,34 +315,25 @@ app.get('/', (req, res) => {
                 if (data.countdown !== undefined) {
                     document.getElementById('timer').innerText = data.countdown;
                 }
-
-                // Update Analytics Stats
                 if (data.analytics) {
                     document.getElementById('statTotal').innerText = data.analytics.totalAnalyzed;
                     document.getElementById('statWinRate').innerText = data.analytics.winRate + '%';
                     document.getElementById('statRatio').innerText = data.analytics.bigPercent + '% / ' + data.analytics.smallPercent + '%';
                     document.getElementById('statHotDue').innerText = 'Hot:' + data.analytics.hotNumber + ' | Due:' + data.analytics.overdueNumber;
                 }
-
-                // Display Expected Prediction Number on Screen
                 if (data.prediction) {
                     document.getElementById('predNum').innerText = data.prediction.suggestedNum;
                     document.getElementById('predType').innerText = data.prediction.suggestedType;
                     document.getElementById('predColor').innerText = data.prediction.suggestedColor;
                     document.getElementById('predColor').style.color = data.prediction.suggestedColor === 'Red' ? '#ff5252' : '#4caf50';
                 }
-
                 if (data.history && data.history.length > 0) {
                     let html = '';
                     data.history.forEach(item => {
                         const badgeClass = item.type === 'Big' ? 'badge-big' : 'badge-small';
                         let statusHtml = '<span style="color:#aaa;">Pending</span>';
-                        if (item.status === 'WIN') {
-                            statusHtml = '<span class="status-win">WIN</span>';
-                        } else if (item.status === 'LOSS') {
-                            statusHtml = '<span class="status-loss">LOSS</span>';
-                        }
-                        
+                        if (item.status === 'WIN') statusHtml = '<span class="status-win">WIN</span>';
+                        else if (item.status === 'LOSS') statusHtml = '<span class="status-loss">LOSS</span>';
                         html += \`<div class="history-item">
                             <span><b>\${String(item.issue).slice(-4)}</b></span>
                             <span>Res: <b>\${item.number}</b> <span class="\${badgeClass}">\${item.type}</span></span>
@@ -490,46 +353,47 @@ app.get('/', (req, res) => {
 let currentRound = {
     periodNumber: "Loading...",
     countdown: 30,
-    livePrediction: { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" }
+    livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
 };
 
-let currentRunCountdown = 30;
-
-// Smart Prediction Logic
+// Smart Big/Small Pattern Matcher based on 2000 Records
 function generateProbabilityPattern(periodStr, history) {
-    if (!history || history.length < 3) return { suggestedNum: 6, suggestedType: "Big", suggestedColor: "Green" };
+    if (!history || history.length < 5) return { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" };
 
-    let last1 = history[0].number;
-    let last2 = history[1].number;
-    let last3 = history[2].number;
+    let recentTypes = history.slice(0, 5).map(h => h.type);
+    let countBig = recentTypes.filter(t => t === 'Big').length;
+    let countSmall = recentTypes.filter(t => t === 'Small').length;
 
-    let p1 = parseInt(periodStr.slice(-1)) || 0;
-    let p2 = parseInt(periodStr.slice(-2, -1)) || 0;
+    let predictedType = "Big";
 
-    let hotBonus = typeof analyticsStats.hotNumber === 'number' ? analyticsStats.hotNumber : 5;
-
-    let calculatedNum = (last1 * 3 + last2 * 2 + last3 + (p1 * 7) + p2 + hotBonus) % 10;
-    if (calculatedNum < 0) calculatedNum += 10;
-
-    // Strict Repeat Blocker
-    if (calculatedNum === last1) {
-        calculatedNum = (last1 + 3) % 10;
+    // Streak / Trend follower logic
+    if (recentTypes[0] === recentTypes[1] && recentTypes[1] === recentTypes[2]) {
+        predictedType = recentTypes[0];
+    } else if (recentTypes[0] !== recentTypes[1] && recentTypes[1] !== recentTypes[2]) {
+        predictedType = recentTypes[0] === 'Big' ? 'Small' : 'Big';
+    } else {
+        predictedType = countBig > countSmall ? 'Small' : 'Big';
     }
 
-    let type = calculatedNum >= 5 ? "Big" : "Small";
-    let color = calculatedNum % 2 === 0 ? "Red" : "Green";
+    let suggestedNum = 7;
+    if (predictedType === "Big") {
+        let bigNums = [5, 6, 7, 8, 9];
+        suggestedNum = bigNums[Math.floor(Math.random() * bigNums.length)];
+    } else {
+        let smallNums = [0, 1, 2, 3, 4];
+        suggestedNum = smallNums[Math.floor(Math.random() * smallNums.length)];
+    }
 
-    return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
+    let color = suggestedNum % 2 === 0 ? "Red" : "Green";
+    return { suggestedNum: suggestedNum, suggestedType: predictedType, suggestedColor: color };
 }
 
-// Fetch Official API & Sync with Supabase
 async function fetchDamanApiData() {
-    if (isFetching) return; // overlap guard
+    if (isFetching) return;
     isFetching = true;
 
     try {
         const json = await fetchRawApi();
-
         if (!json) {
             usingFallback = true;
             await fetchFallback();
@@ -550,7 +414,13 @@ async function fetchDamanApiData() {
 
                     let existing = historyRecords.find(h => h.issue === iss);
                     let pNum = savedPredictions[iss] !== undefined ? savedPredictions[iss] : null;
-                    let status = pNum !== null ? (pNum === num ? "WIN" : "LOSS") : "PENDING";
+                    
+                    // Big/Small based Win/Loss evaluation
+                    let status = "PENDING";
+                    if (pNum !== null) {
+                        let predType = pNum >= 5 ? "Big" : "Small";
+                        status = (predType === type) ? "WIN" : "LOSS";
+                    }
 
                     if (!existing) {
                         historyRecords.push({
@@ -575,7 +445,8 @@ async function fetchDamanApiData() {
                         existing.color = color;
                         if (pNum !== null) {
                             existing.predNum = pNum;
-                            existing.status = (pNum === num) ? "WIN" : "LOSS";
+                            let predType = pNum >= 5 ? "Big" : "Small";
+                            existing.status = (predType === type) ? "WIN" : "LOSS";
                         }
 
                         await supabase.from('test_results').upsert({
@@ -616,7 +487,6 @@ async function fetchDamanApiData() {
             }
         }
     } catch (e) {
-        console.error("API Parse Error:", e.message);
     } finally {
         isFetching = false;
     }
@@ -629,7 +499,6 @@ function startSyncLoop() {
         if (currentRound.countdown > 0) {
             currentRound.countdown--;
         } else {
-            // Timer khatam = naya period. Fallback me period khud aage badhao (stop na ho)
             currentRound.countdown = 30;
             if (usingFallback) {
                 try {
@@ -639,7 +508,7 @@ function startSyncLoop() {
                         currentRound.livePrediction = np;
                         savedPredictions[currentRound.periodNumber] = np.suggestedNum;
                     }
-                } catch (e) { /* ignore */ }
+                } catch (e) {}
             }
         }
 
@@ -655,7 +524,7 @@ function startSyncLoop() {
 
 loadHistoryFromSupabase().then(() => {
     server.listen(PORT, () => {
-        console.log(`Facing AI Server running at http://localhost:${PORT} with 2000 Records & Live Display!`);
+        console.log(`Server running at http://localhost:${PORT}`);
         startSyncLoop();
     });
 });
