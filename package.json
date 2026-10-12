@@ -2,6 +2,7 @@
   "name": "myapp",
   "version": "1.0.0",
   "description": "",
+  "https-proxy-agent": "^7.0.4"
   "main": "script.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
