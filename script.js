@@ -46,7 +46,6 @@ let analyticsStats = {
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
 
-// Origin Cloudflare ke peeche hai -> datacenter IPs ko 403 deta hai.
 const PROXIES = [
     (u) => 'https://proxy.cors.dev/' + u,
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -160,13 +159,13 @@ async function fetchRawApi() {
     return null;
 }
 
-// Fallback: indialotteryapi.com (no auth) — REAL period + countdown deta hai
+// Fallback: indialotteryapi.com — REAL period + REAL countdown (real-time)
 async function fetchFallback() {
     try {
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
         if (!nx || !nx.period) return false;
 
-        // Real period (dash hata ke) — sahi bhi hai aur khud aage badhta bhi hai
+        // Period seedha API se (live + real)
         const p = String(nx.period).replace('-', '');
         if (p !== currentRound.periodNumber) {
             currentRound.periodNumber = p;
@@ -184,8 +183,8 @@ async function fetchFallback() {
             }
         }
 
-        // Countdown drift sirf bade difference pe theek karo (jhatke na ho)
-        if (typeof nx.remain === 'number' && Math.abs(nx.remain - currentRound.countdown) >= 2) {
+        // Countdown seedha API se -> real time se match karega
+        if (typeof nx.remain === 'number') {
             currentRound.countdown = nx.remain;
         }
         return true;
@@ -440,7 +439,6 @@ app.get('/', (req, res) => {
                     document.getElementById('timer').innerText = data.countdown;
                 }
 
-                // Update Analytics Stats
                 if (data.analytics) {
                     document.getElementById('statTotal').innerText = data.analytics.totalAnalyzed;
                     document.getElementById('statWinRate').innerText = data.analytics.winRate + '%';
@@ -448,7 +446,6 @@ app.get('/', (req, res) => {
                     document.getElementById('statHotDue').innerText = 'Hot:' + data.analytics.hotNumber + ' | Due:' + data.analytics.overdueNumber;
                 }
 
-                // Display Expected Prediction Number on Screen
                 if (data.prediction) {
                     document.getElementById('predNum').innerText = data.prediction.suggestedNum;
                     document.getElementById('predType').innerText = data.prediction.suggestedType;
@@ -507,7 +504,6 @@ function generateProbabilityPattern(periodStr, history) {
     let calculatedNum = (last1 * 3 + last2 * 2 + last3 + (p1 * 7) + p2 + hotBonus) % 10;
     if (calculatedNum < 0) calculatedNum += 10;
 
-    // Strict Repeat Blocker
     if (calculatedNum === last1) {
         calculatedNum = (last1 + 3) % 10;
     }
@@ -520,7 +516,7 @@ function generateProbabilityPattern(periodStr, history) {
 
 // Fetch Official API & Sync with Supabase
 async function fetchDamanApiData() {
-    if (isFetching) return; // overlap guard
+    if (isFetching) return;
     isFetching = true;
 
     try {
@@ -550,21 +546,11 @@ async function fetchDamanApiData() {
 
                     if (!existing) {
                         historyRecords.push({
-                            issue: iss,
-                            number: num,
-                            type: type,
-                            color: color,
-                            predNum: pNum,
-                            status: status
+                            issue: iss, number: num, type: type, color: color, predNum: pNum, status: status
                         });
-
                         await supabase.from('test_results').upsert({
-                            period_number: iss,
-                            results: String(num),
-                            pred_num: pNum,
-                            status: status
+                            period_number: iss, results: String(num), pred_num: pNum, status: status
                         }, { onConflict: ['period_number'] });
-
                     } else {
                         existing.number = num;
                         existing.type = type;
@@ -573,12 +559,8 @@ async function fetchDamanApiData() {
                             existing.predNum = pNum;
                             existing.status = (pNum === num) ? "WIN" : "LOSS";
                         }
-
                         await supabase.from('test_results').upsert({
-                            period_number: iss,
-                            results: String(num),
-                            pred_num: existing.predNum,
-                            status: existing.status
+                            period_number: iss, results: String(num), pred_num: existing.predNum, status: existing.status
                         }, { onConflict: ['period_number'] });
                     }
                 }
@@ -605,9 +587,11 @@ async function fetchDamanApiData() {
                     savedPredictions[nextIssueStr] = newPred.suggestedNum;
                 } else {
                     let pNum = savedPredictions[nextIssueStr];
-                    let targetType = pNum >= 5 ? "Big" : "Small";
-                    let color = pNum % 2 === 0 ? "Red" : "Green";
-                    currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
+                    currentRound.livePrediction = {
+                        suggestedNum: pNum,
+                        suggestedType: pNum >= 5 ? "Big" : "Small",
+                        suggestedColor: pNum % 2 === 0 ? "Red" : "Green"
+                    };
                 }
             }
         }
@@ -622,11 +606,10 @@ function startSyncLoop() {
     setInterval(() => {
         fetchDamanApiData();
 
-        // Origin mode me hi local decrement (fallback me API khud set karta hai)
-        if (currentRound.countdown > 0) {
-            currentRound.countdown--;
-        } else {
-            currentRound.countdown = 30;
+        // Origin mode me local decrement; fallback me API khud set karta hai
+        if (!usingFallback) {
+            if (currentRound.countdown > 0) currentRound.countdown--;
+            else currentRound.countdown = 30;
         }
 
         io.emit('timerUpdate', {
