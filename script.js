@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
-const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
 
@@ -27,13 +26,6 @@ const HISTORY_LIMIT = 2000;
 let historyRecords = [];
 let savedPredictions = {};
 let lastProcessedPeriod = null;
-
-// Serve Static Files & Index Page
-app.use(express.static(__dirname));
-
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
 
 // Analytics Stats Object
 let analyticsStats = {
@@ -129,6 +121,209 @@ function runDeepDataAnalysis() {
     };
 }
 
+// Frontend HTML Interface
+app.get('/', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Facing AI Pattern Matcher Tool - Milu</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #121212;
+                color: #ffffff;
+                text-align: center;
+                padding: 15px;
+                margin: 0;
+            }
+            .container {
+                max-width: 460px;
+                margin: 15px auto;
+                background: #1e1e1e;
+                padding: 20px;
+                border-radius: 12px;
+                box-shadow: 0 6px 15px rgba(0,0,0,0.6);
+            }
+            h2 { color: #00e676; margin-bottom: 15px; font-size: 22px; }
+            .timer-box {
+                font-size: 24px;
+                font-weight: bold;
+                color: #ff9800;
+                margin: 10px 0;
+                background: #2a2a2a;
+                padding: 8px;
+                border-radius: 8px;
+            }
+            .period-box {
+                font-size: 16px;
+                color: #b0bec5;
+                margin-bottom: 10px;
+            }
+            .analytics-card {
+                background: #1a232a;
+                border: 1px solid #00b0ff;
+                border-radius: 8px;
+                padding: 10px;
+                margin: 12px 0;
+                font-size: 13px;
+                text-align: left;
+            }
+            .analytics-card h4 {
+                margin: 0 0 8px 0;
+                color: #00b0ff;
+                text-align: center;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+            }
+            .stat-item {
+                background: #252d35;
+                padding: 6px 8px;
+                border-radius: 4px;
+            }
+            .prediction-card {
+                background: #252525;
+                border: 2px solid #00e676;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 15px 0;
+            }
+            .prediction-card h3 { margin: 0 0 8px 0; color: #00e676; font-size: 16px; }
+            .pred-num-box {
+                font-size: 40px;
+                font-weight: bold;
+                color: #00e676;
+                margin: 5px 0;
+            }
+            .pred-details {
+                font-size: 15px;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            .history-container {
+                margin-top: 20px;
+                text-align: left;
+                background: #252525;
+                padding: 12px;
+                border-radius: 8px;
+                max-height: 250px;
+                overflow-y: auto;
+                border: 1px solid #333;
+            }
+            .history-container h3 {
+                margin-top: 0;
+                font-size: 15px;
+                color: #90caf9;
+                border-bottom: 1px solid #444;
+                padding-bottom: 6px;
+            }
+            .history-item {
+                padding: 8px 6px;
+                border-bottom: 1px solid #333;
+                font-size: 12px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .badge-big { background: #4caf50; color: white; padding: 2px 5px; border-radius: 3px; }
+            .badge-small { background: #ff5252; color: white; padding: 2px 5px; border-radius: 3px; }
+            .status-win { background: #2e7d32; color: #fff; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            .status-loss { background: #c62828; color: #fff; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+
+        <div class="container">
+            <h2>Facing AI Pattern Tool - Milu</h2>
+            <div class="period-box">Target Period: <span id="periodNumber" style="color: #fff; font-weight: bold;">Loading...</span></div>
+            <div class="timer-box">Time Left: <span id="timer">30</span>s</div>
+
+            <!-- 2000 Records Data Analytics Card -->
+            <div class="analytics-card">
+                <h4>2000 Records Deep Analysis</h4>
+                <div class="stats-grid">
+                    <div class="stat-item">Analyzed: <b id="statTotal" style="color:#00e676;">0</b></div>
+                    <div class="stat-item">Win Rate: <b id="statWinRate" style="color:#ffb74d;">0%</b></div>
+                    <div class="stat-item">Big/Small: <b id="statRatio">0% / 0%</b></div>
+                    <div class="stat-item">Hot/Due: <b id="statHotDue" style="color:#29b6f6;">- / -</b></div>
+                </div>
+            </div>
+
+            <!-- Prediction Display Card (Shows the exact suggested number & details) -->
+            <div class="prediction-card">
+                <h3>Next Expected Number Prediction</h3>
+                <div class="pred-num-box" id="predNum">-</div>
+                <div class="pred-details">
+                    Type: <span id="predType" style="color:#00b0ff;">-</span> | Color: <span id="predColor">-</span>
+                </div>
+            </div>
+
+            <div class="history-container">
+                <h3>Live History & Win/Loss Status</h3>
+                <div id="historyList">Loading history...</div>
+            </div>
+        </div>
+
+        <script src="/socket.io/socket.io.js"></script>
+        <script>
+            const socket = io();
+
+            socket.on('timerUpdate', (data) => {
+                if (data.periodNumber && data.periodNumber !== "Loading...") {
+                    document.getElementById('periodNumber').innerText = data.periodNumber;
+                }
+                if (data.countdown !== undefined) {
+                    document.getElementById('timer').innerText = data.countdown;
+                }
+
+                // Update Analytics Stats
+                if (data.analytics) {
+                    document.getElementById('statTotal').innerText = data.analytics.totalAnalyzed;
+                    document.getElementById('statWinRate').innerText = data.analytics.winRate + '%';
+                    document.getElementById('statRatio').innerText = data.analytics.bigPercent + '% / ' + data.analytics.smallPercent + '%';
+                    document.getElementById('statHotDue').innerText = 'Hot:' + data.analytics.hotNumber + ' | Due:' + data.analytics.overdueNumber;
+                }
+
+                // Display Expected Prediction Number on Screen
+                if (data.prediction) {
+                    document.getElementById('predNum').innerText = data.prediction.suggestedNum;
+                    document.getElementById('predType').innerText = data.prediction.suggestedType;
+                    document.getElementById('predColor').innerText = data.prediction.suggestedColor;
+                    document.getElementById('predColor').style.color = data.prediction.suggestedColor === 'Red' ? '#ff5252' : '#4caf50';
+                }
+
+                if (data.history && data.history.length > 0) {
+                    let html = '';
+                    data.history.forEach(item => {
+                        const badgeClass = item.type === 'Big' ? 'badge-big' : 'badge-small';
+                        let statusHtml = '<span style="color:#aaa;">Pending</span>';
+                        if (item.status === 'WIN') {
+                            statusHtml = '<span class="status-win">WIN</span>';
+                        } else if (item.status === 'LOSS') {
+                            statusHtml = '<span class="status-loss">LOSS</span>';
+                        }
+                        
+                        html += \`<div class="history-item">
+                            <span><b>\${String(item.issue).slice(-4)}</b></span>
+                            <span>Res: <b>\${item.number}</b> <span class="\${badgeClass}">\${item.type}</span></span>
+                            <span>Pred: \${item.predNum ?? '-'}</span>
+                            <span>\${statusHtml}</span>
+                        </div>\`;
+                    });
+                    document.getElementById('historyList').innerHTML = html;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    `);
+});
+
 let currentRound = {
     periodNumber: "Loading...",
     countdown: 30,
@@ -169,21 +364,14 @@ async function fetchDamanApiData() {
 
     https.get(url, {
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
         }
     }, (res) => {
         let rawData = '';
         res.on('data', (chunk) => { rawData += chunk; });
         res.on('end', async () => {
             try {
-                if (rawData.trim().startsWith('<')) {
-                    console.log("API returned HTML (Block page). Skipping this cycle...");
-                    return;
-                }
-
                 const json = JSON.parse(rawData);
                 const dataObj = json.data || json;
                 let listArray = dataObj.list || dataObj.data?.list || json.list || [];
@@ -277,7 +465,7 @@ function startSyncLoop() {
         fetchDamanApiData();
 
         if (currentRound.countdown > 0) {
-            currentRound.countdown--;
+            currentRunCountdown = currentRound.countdown--;
         } else {
             currentRound.countdown = 30;
         }
@@ -291,18 +479,6 @@ function startSyncLoop() {
         });
     }, 1000);
 }
-
-// Socket Connection
-io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
-    socket.emit('timerUpdate', {
-        periodNumber: currentRound.periodNumber,
-        countdown: currentRound.countdown,
-        prediction: currentRound.livePrediction,
-        analytics: analyticsStats,
-        history: historyRecords
-    });
-});
 
 loadHistoryFromSupabase().then(() => {
     server.listen(PORT, () => {
