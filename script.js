@@ -1,5 +1,5 @@
 const express = require('express');
-const http = http = require('http'); // Syntax cleaned
+const http = require('http');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
@@ -186,11 +186,9 @@ function startSyncLoop() {
             lastProcessedPeriod = exactPeriod;
             currentRound.periodNumber = exactPeriod;
 
-            // Generate random result (0-9) for the period that just ended
             let generatedResult = Math.floor(Math.random() * 10);
             let predNumUsed = savedPredictions[finishedPeriod] !== undefined ? savedPredictions[finishedPeriod] : null;
             
-            // Calculate Win/Loss status if prediction existed
             let status = "PENDING";
             if (predNumUsed !== null) {
                 let actualType = generatedResult >= 5 ? "Big" : "Small";
@@ -198,7 +196,6 @@ function startSyncLoop() {
                 status = (actualType === predType) ? "WIN" : "LOSS";
             }
 
-            // Save to Supabase Database automatically
             try {
                 await supabase.from('test_results').insert([
                     {
@@ -209,7 +206,6 @@ function startSyncLoop() {
                     }
                 ]);
                 
-                // Reload history to keep it fresh
                 await loadHistoryFromSupabase();
             } catch (err) {
                 console.error("Error auto-saving result:", err.message);
@@ -218,7 +214,6 @@ function startSyncLoop() {
 
         currentRound.countdown = remainingSec;
 
-        // Generate or fetch prediction for current period
         if (!savedPredictions[exactPeriod]) {
             let pred = generateSmartPrediction(exactPeriod, historyRecords);
             currentRound.livePrediction = pred;
@@ -232,7 +227,6 @@ function startSyncLoop() {
             };
         }
 
-        // Broadcast live updates to connected clients (Mobile / PC)
         io.emit('timerUpdate', {
             periodNumber: currentRound.periodNumber,
             countdown: currentRound.countdown,
