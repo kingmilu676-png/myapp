@@ -1,14 +1,18 @@
 {
-  "name": "wingo-tool",
+  "name": "myapp",
   "version": "1.0.0",
-  "description": "Facing AI Pattern Tool",
+  "description": "",
   "main": "script.js",
   "scripts": {
-    "start": "node script.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "@supabase/supabase-js": "^2.117.3",
+    "express": "^5.3.0",
+    "socket.io": "^4.8.4"
   }
 }
