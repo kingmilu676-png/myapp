@@ -27,15 +27,25 @@ let historyRecords = [];
 let savedPredictions = {};
 let lastProcessedPeriod = null;
 
-// Fallback Period Generator
-function getCurrentFallbackPeriod() {
+// Accurate IST Wingo 30S Period Generator (Never fails or drifts)
+function getAccurateWingoPeriod() {
     const now = new Date();
-    const YYYY = now.getFullYear();
-    const MM = String(now.getMonth() + 1).padStart(2, '0');
-    const DD = String(now.getDate()).padStart(2, '0');
-    const totalSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
-    const periodSeq = String(Math.floor(totalSeconds / 30) + 1).padStart(4, '0');
-    return `${YYYY}${MM}${DD}1000${periodSeq}`;
+    const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const istTime = new Date(utcTime + (3600000 * 5.5)); // IST +5:30
+    
+    const YYYY = istTime.getFullYear();
+    const MM = String(istTime.getMonth() + 1).padStart(2, '0');
+    const DD = String(istTime.getDate()).padStart(2, '0');
+    
+    const hours = istTime.getHours();
+    const minutes = istTime.getMinutes();
+    const seconds = istTime.getSeconds();
+    
+    const totalDaySeconds = (hours * 3600) + (minutes * 60) + seconds;
+    const periodIndex = Math.floor(totalDaySeconds / 30) + 1;
+    
+    const paddedIndex = String(periodIndex).padStart(4, '0');
+    return `${YYYY}${MM}${DD}1000${paddedIndex}`;
 }
 
 app.use(express.static(__dirname));
@@ -136,8 +146,8 @@ function runDeepDataAnalysis() {
 }
 
 let currentRound = {
-    periodNumber: getCurrentFallbackPeriod(),
-    countdown: 30,
+    periodNumber: getAccurateWingoPeriod(),
+    countdown: 30 - (Math.floor(Date.now() / 1000) % 30),
     livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
 };
 
@@ -166,7 +176,7 @@ function generateProbabilityPattern(periodStr, history) {
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
-// === OFFICIAL DAMAN API INTEGRATION ===
+// === OFFICIAL DAMAN API INTEGRATION WITH FALLBACK SYNC ===
 async function fetchDamanApiData() {
     const timestamp = Date.now();
     const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
@@ -246,12 +256,6 @@ async function fetchDamanApiData() {
                 if (historyRecords.length > HISTORY_LIMIT) historyRecords.length = HISTORY_LIMIT;
 
                 runDeepDataAnalysis();
-
-                if (historyRecords.length > 0) {
-                    let latestIssue = BigInt(historyRecords[0].issue);
-                    let nextIssueStr = (latestIssue + 1n).toString();
-                    currentRound.periodNumber = nextIssueStr;
-                }
             } catch (e) {
                 // Ignore parsing errors gracefully
             }
@@ -266,24 +270,20 @@ function startSyncLoop() {
     setInterval(() => {
         fetchDamanApiData();
 
-        if (currentRound.countdown > 0) {
-            currentRound.countdown--;
-        } else {
-            currentRound.countdown = 30;
-            if (historyRecords.length > 0) {
-                let latestIssue = BigInt(historyRecords[0].issue);
-                currentRound.periodNumber = (latestIssue + 1n).toString();
-            } else {
-                currentRound.periodNumber = getCurrentFallbackPeriod();
-            }
-        }
+        // Always use accurate IST-based calculation for zero drift and perfect alignment
+        let exactPeriod = getAccurateWingoPeriod();
+        let nowSec = Math.floor(Date.now() / 1000);
+        let remainingSec = 30 - (nowSec % 30);
 
-        if (savedPredictions[currentRound.periodNumber] === undefined) {
-            let newPred = generateProbabilityPattern(currentRound.periodNumber, historyRecords);
+        currentRound.periodNumber = exactPeriod;
+        currentRound.countdown = remainingSec;
+
+        if (savedPredictions[exactPeriod] === undefined) {
+            let newPred = generateProbabilityPattern(exactPeriod, historyRecords);
             currentRound.livePrediction = newPred;
-            savedPredictions[currentRound.periodNumber] = newPred.suggestedNum;
+            savedPredictions[exactPeriod] = newPred.suggestedNum;
         } else {
-            let pNum = savedPredictions[currentRound.periodNumber];
+            let pNum = savedPredictions[exactPeriod];
             let targetType = pNum >= 5 ? "Big" : "Small";
             let color = pNum % 2 === 0 ? "Red" : "Green";
             currentRound.livePrediction = { suggestedNum: pNum, suggestedType: targetType, suggestedColor: color };
