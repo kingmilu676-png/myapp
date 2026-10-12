@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
@@ -20,30 +21,8 @@ const SUPABASE_URL = 'https://knafkiozaguyvemtrjfz.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_Lv7-h7zaLkSnPXgYc77_ig_wp71xmJ6';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const HISTORY_LIMIT = 2000;
 let historyRecords = [];
 let savedPredictions = {};
-
-// Accurate IST Wingo 30S Period Generator
-function getAccurateWingoPeriod() {
-    const now = new Date();
-    const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const istTime = new Date(utcTime + (3600000 * 5.5));
-    
-    const YYYY = istTime.getFullYear();
-    const MM = String(istTime.getMonth() + 1).padStart(2, '0');
-    const DD = String(istTime.getDate()).padStart(2, '0');
-    
-    const hours = istTime.getHours();
-    const minutes = istTime.getMinutes();
-    const seconds = istTime.getSeconds();
-    
-    const totalDaySeconds = (hours * 3600) + (minutes * 60) + seconds;
-    const periodIndex = Math.floor(totalDaySeconds / 30) + 1;
-    
-    const paddedIndex = String(periodIndex).padStart(4, '0');
-    return `${YYYY}${MM}${DD}1000${paddedIndex}`;
-}
 
 app.use(express.static(__dirname));
 
@@ -60,13 +39,14 @@ let analyticsStats = {
     winRate: "0.0"
 };
 
-// === FETCH API DATA FROM DAMAN (Completed & Fixed) ===
+// === FETCH DATA VIA PROXY WORKER (RENDER ENV VARIABLE) ===
 function fetchDamanApiData() {
     return new Promise((resolve, reject) => {
-        const timestamp = Date.now();
-        const url = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts=${timestamp}`;
+        // Yeh Render ke Environment Variable (PROXY_WORKER) ka use karega
+        const proxyUrl = process.env.PROXY_WORKER || 'https://wingo-proxy.kingmilu676.workers.dev';
+        const url = `${proxyUrl}?ts=${Date.now()}`;
 
-        http.get(url, {
+        https.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'application/json'
@@ -81,85 +61,23 @@ function fetchDamanApiData() {
             res.on('end', () => {
                 try {
                     const parsedData = JSON.parse(rawData);
-                    // Check if data is valid and contains list/records
                     if (parsedData && parsedData.data && parsedData.data.list) {
                         resolve(parsedData.data.list);
+                    } else if (Array.isArray(parsedData)) {
+                        resolve(parsedData);
                     } else {
                         resolve(null);
                     }
                 } catch (e) {
-                    reject(e);
+                    console.error("JSON Parse Error:", e.message);
+                    resolve(null);
                 }
             });
         }).on('error', (err) => {
-            reject(err);
+            console.error("Proxy Fetch Error:", err.message);
+            resolve(null);
         });
     });
-}
-
-// Load and Sync History with Daman API and Supabase
-async function syncAndLoadHistory() {
-    try {
-        // First try to fetch fresh data from Daman API
-        const apiList = await fetchDamanApiData();
-        
-        if (apiList && apiList.length > 0) {
-            historyRecords = apiList.map(item => {
-                const num = parseInt(item.number ?? 0);
-                const issueStr = String(item.issueNumber || item.periodNumber || '');
-                const pred = savedPredictions[issueStr] !== undefined ? savedPredictions[issueStr] : null;
-                
-                let status = "PENDING";
-                if (pred !== null) {
-                    let actualType = num >= 5 ? "Big" : "Small";
-                    let predType = pred >= 5 ? "Big" : "Small";
-                    status = (actualType === predType) ? "WIN" : "LOSS";
-                }
-
-                return {
-                    issue: issueStr,
-                    number: num,
-                    type: num >= 5 ? "Big" : "Small",
-                    color: num % 2 === 0 ? "Red" : "Green",
-                    predNum: pred,
-                    status: status
-                };
-            });
-            runDeepDataAnalysis();
-        } else {
-            // Fallback to Supabase if API returns empty
-            await loadHistoryFromSupabase();
-        }
-    } catch (e) {
-        console.log("API Fetch exception, falling back to Supabase:", e.message);
-        await loadHistoryFromSupabase();
-    }
-}
-
-async function loadHistoryFromSupabase() {
-    try {
-        const { data, error } = await supabase
-            .from('test_results')
-            .select('*')
-            .order('period_number', { ascending: false })
-            .limit(HISTORY_LIMIT);
-
-        if (error) return;
-
-        if (data && data.length > 0) {
-            historyRecords = data.map(item => ({
-                issue: String(item.period_number),
-                number: parseInt(item.results ?? 0),
-                type: parseInt(item.results ?? 0) >= 5 ? "Big" : "Small",
-                color: parseInt(item.results ?? 0) % 2 === 0 ? "Red" : "Green",
-                predNum: item.pred_num ?? null,
-                status: item.status || "PENDING"
-            }));
-            runDeepDataAnalysis();
-        }
-    } catch (e) {
-        console.log("Supabase Load exception:", e);
-    }
 }
 
 function runDeepDataAnalysis() {
@@ -214,11 +132,15 @@ function runDeepDataAnalysis() {
     };
 }
 
-let currentRound = {
-    periodNumber: getAccurateWingoPeriod(),
-    countdown: 30 - (Math.floor(Date.now() / 1000) % 30),
-    livePrediction: { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" }
-};
+function getNextPeriodNumber(lastIssue) {
+    if (!lastIssue) return "Loading...";
+    try {
+        let bigNum = BigInt(lastIssue);
+        return (bigNum + 1n).toString();
+    } catch (e) {
+        return lastIssue;
+    }
+}
 
 function generateSmartPrediction(periodStr, history) {
     if (!history || history.length < 3) return { suggestedNum: 7, suggestedType: "Big", suggestedColor: "Green" };
@@ -241,41 +163,69 @@ function generateSmartPrediction(periodStr, history) {
     return { suggestedNum: calculatedNum, suggestedType: type, suggestedColor: color };
 }
 
-let lastProcessedPeriod = currentRound.periodNumber;
+let activePeriodNumber = "Loading...";
 
-// Main Real-Time Sync Loop
+async function updateLiveGameData() {
+    try {
+        const apiList = await fetchDamanApiData();
+        if (apiList && apiList.length > 0) {
+            let latestIssue = apiList[0].issueNumber || apiList[0].periodNumber || apiList[0].issue;
+            activePeriodNumber = getNextPeriodNumber(latestIssue);
+
+            historyRecords = apiList.map(item => {
+                const issueStr = String(item.issueNumber || item.periodNumber || item.issue || '');
+                const num = parseInt(item.number ?? item.result ?? 0);
+                const pred = savedPredictions[issueStr] !== undefined ? savedPredictions[issueStr] : null;
+
+                let status = "PENDING";
+                if (pred !== null) {
+                    let actualType = num >= 5 ? "Big" : "Small";
+                    let predType = pred >= 5 ? "Big" : "Small";
+                    status = (actualType === predType) ? "WIN" : "LOSS";
+                }
+
+                return {
+                    issue: issueStr,
+                    number: num,
+                    type: num >= 5 ? "Big" : "Small",
+                    color: num % 2 === 0 ? "Red" : "Green",
+                    predNum: pred,
+                    status: status
+                };
+            });
+
+            runDeepDataAnalysis();
+        }
+    } catch (err) {
+        console.error("Game sync error:", err.message);
+    }
+}
+
 function startSyncLoop() {
     setInterval(async () => {
-        let exactPeriod = getAccurateWingoPeriod();
         let nowSec = Math.floor(Date.now() / 1000);
         let remainingSec = 30 - (nowSec % 30);
 
-        if (exactPeriod !== lastProcessedPeriod) {
-            lastProcessedPeriod = exactPeriod;
-            currentRound.periodNumber = exactPeriod;
-            // Fetch fresh data whenever period shifts
-            await syncAndLoadHistory();
+        if (remainingSec === 30 || remainingSec === 1 || historyRecords.length === 0) {
+            await updateLiveGameData();
         }
 
-        currentRound.countdown = remainingSec;
-
-        if (!savedPredictions[exactPeriod]) {
-            let pred = generateSmartPrediction(exactPeriod, historyRecords);
-            currentRound.livePrediction = pred;
-            savedPredictions[exactPeriod] = pred.suggestedNum;
-        } else {
-            let pNum = savedPredictions[exactPeriod];
-            currentRound.livePrediction = {
-                suggestedNum: pNum,
-                suggestedType: pNum >= 5 ? "Big" : "Small",
-                suggestedColor: pNum % 2 === 0 ? "Red" : "Green"
-            };
+        if (activePeriodNumber !== "Loading..." && !savedPredictions[activePeriodNumber]) {
+            let pred = generateSmartPrediction(activePeriodNumber, historyRecords);
+            savedPredictions[activePeriodNumber] = pred.suggestedNum;
         }
+
+        let currentPredNum = savedPredictions[activePeriodNumber] !== undefined ? savedPredictions[activePeriodNumber] : 7;
+        let currentPrediction = {
+            suggestedNum: currentPredNum,
+            suggestedType: currentPredNum >= 5 ? "Big" : "Small",
+            suggestedColor: currentPredNum % 2 === 0 ? "Red" : "Green"
+        };
 
         io.emit('timerUpdate', {
-            periodNumber: currentRound.periodNumber,
-            countdown: currentRound.countdown,
-            prediction: currentRound.livePrediction,
+            periodNumber: activePeriodNumber,
+            countdown: remainingSec,
+            prediction: currentPrediction,
             analytics: analyticsStats,
             history: historyRecords
         });
@@ -283,18 +233,22 @@ function startSyncLoop() {
 }
 
 io.on('connection', (socket) => {
+    let currentPredNum = savedPredictions[activePeriodNumber] !== undefined ? savedPredictions[activePeriodNumber] : 7;
     socket.emit('timerUpdate', {
-        periodNumber: currentRound.periodNumber,
-        countdown: currentRound.countdown,
-        prediction: currentRound.livePrediction,
+        periodNumber: activePeriodNumber,
+        countdown: 30 - (Math.floor(Date.now() / 1000) % 30),
+        prediction: {
+            suggestedNum: currentPredNum,
+            suggestedType: currentPredNum >= 5 ? "Big" : "Small",
+            suggestedColor: currentPredNum % 2 === 0 ? "Red" : "Green"
+        },
         analytics: analyticsStats,
         history: historyRecords
     });
 });
 
-syncAndLoadHistory().then(() => {
-    server.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-        startSyncLoop();
-    });
+server.listen(PORT, async () => {
+    console.log(`Server running on port ${PORT}`);
+    await updateLiveGameData();
+    startSyncLoop();
 });
