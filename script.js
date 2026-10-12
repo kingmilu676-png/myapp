@@ -43,7 +43,6 @@ let analyticsStats = {
 // ============================================================
 const API_BASE = 'https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json';
 const FALLBACK_NEXT = 'https://indialotteryapi.com/wp-json/wingo/v1/next?market=0.5';
-const FALLBACK_PRED = 'https://indialotteryapi.com/wp-json/wingo/v1/predict?market=0.5&n=1';
 
 // Origin ab server/cloud IPs ko 403 deta hai -> proxy + fallback zaroori
 const PROXIES = [
@@ -163,22 +162,38 @@ async function fetchRawApi() {
 // Fallback: indialotteryapi.com (no auth, datacenter se chalta hai)
 async function fetchFallback() {
     try {
+        // Sirf countdown ke liye API (period yahan se nahi lenge)
         const nx = tryParseJson((await httpGetText(FALLBACK_NEXT)).raw);
-        if (!nx || !nx.period) return false;
+        if (nx && typeof nx.remain === 'number') currentRound.countdown = nx.remain;
 
-        currentRound.periodNumber = nx.period;
-        if (typeof nx.remain === 'number') currentRound.countdown = nx.remain;
+        // Target period: history ke latest se +1 (consistent, dash-free)
+        if (historyRecords.length > 0) {
+            let next = null;
+            try { next = (BigInt(historyRecords[0].issue) + 1n).toString(); } catch (e) {}
+            if (!next && nx && nx.period) next = String(nx.period).replace('-', '');
 
-        const pr = tryParseJson((await httpGetText(FALLBACK_PRED)).raw);
-        const item = pr && pr.items && pr.items[0];
-        if (item) {
-            currentRound.livePrediction = {
-                suggestedNum: item.digit,
-                suggestedType: item.bigSmall,
-                suggestedColor: item.color
-            };
+            if (next) {
+                currentRound.periodNumber = next; // dash hata ke, history jaisa format
+
+                if (savedPredictions[next] === undefined) {
+                    const np = generateProbabilityPattern(next, historyRecords);
+                    currentRound.livePrediction = np;
+                    savedPredictions[next] = np.suggestedNum;
+                } else {
+                    const p = savedPredictions[next];
+                    currentRound.livePrediction = {
+                        suggestedNum: p,
+                        suggestedType: p >= 5 ? "Big" : "Small",
+                        suggestedColor: p % 2 === 0 ? "Red" : "Green"
+                    };
+                }
+            }
+        } else if (nx && nx.period) {
+            // history khaali ho to sirf API period, dash hata ke
+            currentRound.periodNumber = String(nx.period).replace('-', '');
         }
-        console.log(`[API] fallback OK period=${nx.period} remain=${nx.remain}`);
+
+        console.log(`[API] fallback OK period=${currentRound.periodNumber}`);
         return true;
     } catch (e) {
         console.log('[API] fallback error:', e.message);
